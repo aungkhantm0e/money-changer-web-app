@@ -20,21 +20,34 @@ export default function LoginPage({ onLoggedIn }) {
     }
   }
 
-  return (
-    <div style={{ maxWidth: 360 }}>
-      <h3 style={{ marginTop: 0 }}>Login</h3>
-      <form onSubmit={handleLogin} style={{ display: "grid", gap: 12 }}>
-        <label style={{ display: "grid", gap: 6 }}>
+ return (
+  <div className="login-wrapper">
+    <div className="login-card">
+      <h3>Login</h3>
+
+      <form onSubmit={handleLogin} className="login-form">
+        <label>
           Username
-          <input value={username} onChange={(e) => setUsername(e.target.value)} style={{ padding: 10 }} />
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
         </label>
-        <label style={{ display: "grid", gap: 6 }}>
+
+        <label>
           Password
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={{ padding: 10 }} />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </label>
-        {error ? <div style={{ color: "crimson" }}>{error}</div> : null}
-        <button style={{ padding: 12, fontSize: 16 }}>Login</button>
+
+        {error && <div className="login-error">{error}</div>}
+
+        <button type="submit">Login</button>
       </form>
     </div>
-  );
+  </div>
+);
 }

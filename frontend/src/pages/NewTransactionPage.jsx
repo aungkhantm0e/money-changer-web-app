@@ -59,7 +59,7 @@ export default function NewTransactionPage() {
 
     const fa = Number(foreignAmount);
     if (!currencyCode) return setError("Pick a currency.");
-    if (!Number.isFinite(fa) || fa <= 0) return setError("Foreign amount must be > 0.");
+    if (!Number.isFinite(fa) || fa <= 0) return setError("Foreign amount must be more than 0.");
 
     setLoading(true);
     try {

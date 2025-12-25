@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Routes, Route, Link, useNavigate } from "react-router-dom";
+import "./App.css";
+import { Routes, Route, Link, useNavigate, NavLink } from "react-router-dom";
 import axios from "axios";
 import NewTransactionPage from "./pages/NewTransactionPage.jsx";
 import ReceiptPage from "./pages/ReceiptPage.jsx";
@@ -30,37 +31,9 @@ export default function App() {
   }
 
   return (
-    <div style={{ padding: 16, fontFamily: "system-ui, Arial" }}>
-      <header style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>
-        <h2 style={{ margin: 0 }}>Money Changer</h2>
-
-        {me ? (
-          <>
-            <nav style={{ display: "flex", gap: 12 }}>
-              <Link to="/">New Transaction</Link>
-              <Link to="/transactions">Transactions</Link>
-              <Link to="/reports">Reports</Link>
-              {me?.role === "admin" ? <Link to="/daily-report">Daily Report</Link> : null}
-              {me?.role === "admin" ?<Link to="/monthly-report">Monthly Print</Link> : null}
-              {me?.role === "admin" ?<Link to="/yearly-report">Yearly Print</Link> : null}
-              {me?.role === "admin" ? <Link to="/rates">Rates</Link> : null}
-              {me?.role === "admin" ? <Link to="/balances">Balances</Link> : null}
-            </nav>
-            <div style={{ marginLeft: "auto", display: "flex", gap: 12, alignItems: "center" }}>
-              <span>
-                {me.fullName} ({me.role})
-              </span>
-              <button onClick={logout}>Logout</button>
-            </div>
-          </>
-        ) : (
-          <div style={{ marginLeft: "auto" }}>
-            <Link to="/login">Login</Link>
-          </div>
-        )}
-        
-      </header>
-
+  <div className="app-shell">
+    {/* LEFT SIDE: page content */}
+    <main className="app-content">
       <Routes>
         <Route path="/login" element={<LoginPage onLoggedIn={setMe} />} />
         <Route path="/" element={me ? <NewTransactionPage /> : <LoginGate />} />
@@ -73,8 +46,80 @@ export default function App() {
         <Route path="/monthly-report" element={me ? <MonthlyReportPage /> : <LoginGate />} />
         <Route path="/yearly-report" element={me ? <YearlyReportPage /> : <LoginGate />} />
       </Routes>
-    </div>
-  );
+    </main>
+
+    {/* RIGHT SIDE: stacked nav */}
+    {me ? (
+      <aside className="app-nav">
+        <div className="nav-top">
+          <h2 className="brand">Money Changer</h2>
+          <div className="me">
+            {me.fullName} ({me.role})
+          </div>
+        </div>
+
+        <NavLink to="/" className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}>
+          New Transaction
+        </NavLink>
+        <NavLink
+          to="/transactions"
+          className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+        >
+          Transactions
+        </NavLink>
+        <NavLink
+          to="/reports"
+          className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+        >
+          Reports
+        </NavLink>
+
+        {me.role === "admin" && (
+          <>
+            <div className="nav-divider" />
+
+            <NavLink
+              to="/daily-report"
+              className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+            >
+              Daily Report
+            </NavLink>
+            <NavLink
+              to="/monthly-report"
+              className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+            >
+              Monthly Report
+            </NavLink>
+            <NavLink
+              to="/yearly-report"
+              className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+            >
+              Yearly Report
+            </NavLink>
+            <NavLink
+              to="/rates"
+              className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+            >
+              Rates
+            </NavLink>
+            <NavLink
+              to="/balances"
+              className={({ isActive }) => "nav-btn" + (isActive ? " active" : "")}
+            >
+              Balances
+            </NavLink>
+          </>
+        )}
+
+        <div className="nav-footer">
+          <button className="logout-btn" onClick={logout}>
+            Logout
+          </button>
+        </div>
+      </aside>
+    ) : null}
+  </div>
+);
 }
 
 function LoginGate() {
