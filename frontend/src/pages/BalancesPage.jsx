@@ -20,16 +20,38 @@ export default function BalancesPage() {
   const [openingInput, setOpeningInput] = useState("");
   const [closingInput, setClosingInput] = useState("");
 
+  // Active currencies (for showing ALL cards)
+  const [currencies, setCurrencies] = useState([]);
+
+  // FX errors + per-currency inputs
+  const [fxError, setFxError] = useState("");
+  const [fxOpeningInputs, setFxOpeningInputs] = useState({});
+  const [fxClosingInputs, setFxClosingInputs] = useState({});
+
   async function load() {
     setError("");
+    setFxError("");
     setLoading(true);
+
     try {
       const res = await axios.get(`/api/balances?date=${encodeURIComponent(date)}`);
       setData(res.data);
 
-      // prefill inputs if values exist
+      // prefill MMK inputs if values exist
       setOpeningInput(res.data.openingBalanceMMK ?? "");
       setClosingInput(res.data.closingBalanceMMK ?? "");
+
+      // prefill FX inputs from API rows
+      const list = res.data?.fxBalances ?? [];
+      const openMap = {};
+      const closeMap = {};
+      for (const fx of list) {
+        openMap[fx.currency] = fx.openingAmount ?? 0;
+        closeMap[fx.currency] = fx.closingAmount ?? 0;
+      }
+
+      setFxOpeningInputs(openMap);
+      setFxClosingInputs(closeMap);
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
       setData(null);
@@ -38,8 +60,20 @@ export default function BalancesPage() {
     }
   }
 
+  // auth/me
   useEffect(() => {
     axios.get("/api/auth/me").then((res) => setMe(res.data)).catch(() => setMe(null));
+  }, []);
+
+  // currencies list (active only)
+  useEffect(() => {
+    axios
+      .get("/api/currencies")
+      .then((res) => {
+        const active = (res.data || []).filter((c) => c.is_active);
+        setCurrencies(active);
+      })
+      .catch(() => setCurrencies([]));
   }, []);
 
   useEffect(() => {
@@ -49,7 +83,7 @@ export default function BalancesPage() {
 
   const isAdmin = me?.role === "admin";
 
-  // Profit/Loss = Actual Closing - Opening (green profit, red loss)
+  // Profit/Loss = Actual Closing - Opening (MMK)
   const profitLoss = useMemo(() => {
     if (!data) return null;
     const opening = data.openingBalanceMMK === null ? null : Number(data.openingBalanceMMK);
@@ -78,7 +112,6 @@ export default function BalancesPage() {
     if (!data) return setError("No balance data loaded");
     if (data.openingBalanceMMK === null) return setError("Set opening balance first.");
 
-    // If closingInput is empty, use suggested closing automatically
     const useSuggested = String(closingInput).trim() === "";
     const closingValue = useSuggested ? Number(data.suggestedClosingMMK) : Number(closingInput);
 
@@ -104,6 +137,71 @@ export default function BalancesPage() {
     }
   }
 
+  // ===== FX card actions =====
+
+  async function saveFxOpening(currency) {
+    setFxError("");
+    const raw = fxOpeningInputs[currency] ?? 0;
+    const amount = Number(raw);
+
+    if (!Number.isFinite(amount) || amount < 0) {
+      return setFxError("Opening must be a number >= 0");
+    }
+
+    try {
+      await axios.post("/api/balances/open-fx", { date, currency, openingAmount: amount });
+      await load();
+    } catch (e) {
+      setFxError(e?.response?.data?.error || e.message);
+    }
+  }
+
+  async function saveFxClosing(currency) {
+    setFxError("");
+    const raw = fxClosingInputs[currency] ?? 0;
+    const amount = Number(raw);
+
+    if (!Number.isFinite(amount) || amount < 0) {
+      return setFxError("Closing must be a number >= 0");
+    }
+
+    try {
+      await axios.post("/api/balances/close-fx", { date, currency, closingAmount: amount });
+      await load();
+    } catch (e) {
+      setFxError(e?.response?.data?.error || e.message);
+    }
+  }
+
+  // ===== Build cards for ALL currencies =====
+  const fxBalances = data?.fxBalances ?? [];
+
+  const fxCards = currencies.map((c) => {
+    const existing = fxBalances.find((x) => x.currency === c.code);
+
+    const openingAmount = existing?.openingAmount ?? 0;
+    const closingAmount = existing?.closingAmount ?? 0;
+    const foreignIn = existing?.foreignIn ?? 0;
+    const foreignOut = existing?.foreignOut ?? 0;
+    const netForeign = existing?.netForeign ?? Number((foreignIn - foreignOut).toFixed(2));
+    const suggestedClosingAmount =
+      existing?.suggestedClosingAmount ?? Number((openingAmount + netForeign).toFixed(2));
+    const diffAmount =
+      existing?.diffAmount ?? Number((closingAmount - suggestedClosingAmount).toFixed(2));
+
+    return {
+      currency: c.code,
+      name: c.name,
+      openingAmount,
+      closingAmount,
+      foreignIn,
+      foreignOut,
+      netForeign,
+      suggestedClosingAmount,
+      diffAmount,
+    };
+  });
+
   return (
     <div style={{ maxWidth: 900 }}>
       <h3 style={{ marginTop: 0 }}>Balances</h3>
@@ -119,11 +217,11 @@ export default function BalancesPage() {
         </button>
 
         {data?.isClosed ? (
-          <span style={{ padding: "6px 10px", borderRadius: 999, background: "red",color:"white" }}>
+          <span style={{ padding: "6px 10px", borderRadius: 999, background: "red", color: "white" }}>
             <b>CLOSED</b>
           </span>
         ) : (
-          <span style={{ padding: "6px 10px", borderRadius: 999, background: "#00fd1eff", color:"black" }}>
+          <span style={{ padding: "6px 10px", borderRadius: 999, background: "#00fd1eff", color: "black" }}>
             <b>OPEN</b>
           </span>
         )}
@@ -134,6 +232,84 @@ export default function BalancesPage() {
 
       {data ? (
         <>
+          {/* FX Cards - ALL currencies */}
+          <div style={{ marginBottom: 16 }}>
+            <h4 style={{ marginTop: 0 }}>FX Balances</h4>
+            {fxError ? <div style={{ color: "crimson", marginBottom: 10 }}>{fxError}</div> : null}
+
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              {fxCards.map((fx) => (
+                <div key={fx.currency} style={{ ...card, minWidth: 300 }}>
+                  <div style={small}>
+                    {fx.currency} — {fx.name}
+                  </div>
+
+                  {/* Opening / Closing inputs */}
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 10 }}>
+                    <label style={{ ...lbl, width: 130 }}>
+                      Opening
+                      <input
+                        type="number"
+                        value={fxOpeningInputs[fx.currency] ?? fx.openingAmount}
+                        onChange={(e) =>
+                          setFxOpeningInputs((p) => ({ ...p, [fx.currency]: e.target.value }))
+                        }
+                        style={{ ...inp, width: 130 }}
+                        disabled={!isAdmin || !!data.isClosed}
+                      />
+                    </label>
+
+                    <label style={{ ...lbl, width: 130 }}>
+                      Closing
+                      <input
+                        type="number"
+                        value={fxClosingInputs[fx.currency] ?? fx.closingAmount}
+                        onChange={(e) =>
+                          setFxClosingInputs((p) => ({ ...p, [fx.currency]: e.target.value }))
+                        }
+                        style={{ ...inp, width: 130 }}
+                        disabled={!isAdmin || !!data.isClosed}
+                      />
+                    </label>
+                  </div>
+
+                  {/* Buttons */}
+                  {isAdmin ? (
+                    <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                      <button onClick={() => saveFxOpening(fx.currency)} style={btn} disabled={!!data.isClosed}>
+                        Save Opening
+                      </button>
+                      <button onClick={() => saveFxClosing(fx.currency)} style={btn} disabled={!!data.isClosed}>
+                        Save Closing
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {/* Totals */}
+                  <div style={{ marginTop: 12, borderTop: "1px solid #eee", paddingTop: 10 }}>
+                    <div style={small}>
+                      In (BUY): <b>{fx.foreignIn}</b>
+                    </div>
+                    <div style={small}>
+                      Out (SELL): <b>{fx.foreignOut}</b>
+                    </div>
+                    <div style={small}>
+                      Suggested Closing: <b>{fx.suggestedClosingAmount}</b>
+                    </div>
+                    <div style={small}>
+                      Difference:{" "}
+                      <b style={{ color: fx.diffAmount < 0 ? "crimson" : fx.diffAmount > 0 ? "green" : "inherit" }}>
+                        {fx.diffAmount}
+                      </b>
+                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.7 }}>green = over, red = short</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* MMK cards */}
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
             <div style={card}>
               <div style={small}>Opening Balance (MMK)</div>
@@ -165,13 +341,11 @@ export default function BalancesPage() {
               <div style={{ ...big, color: profitLoss === null ? "inherit" : profitLoss < 0 ? "crimson" : "green" }}>
                 {profitLoss === null ? "-" : profitLoss}
               </div>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>
-                green = profit, red = loss
-              </div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>green = profit, red = loss</div>
             </div>
           </div>
 
-          {/* Admin actions */}
+          {/* Admin actions (MMK only now) */}
           {isAdmin ? (
             <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12 }}>
               <h4 style={{ marginTop: 0 }}>Admin Actions</h4>

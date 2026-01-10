@@ -527,49 +527,390 @@ app.post("/api/balances/open", requireAuth, async (req, res) => {
   }
 });
 
-// Get balance + totals for a date (suggested closing = opening + received - paid_out)
-app.get("/api/balances", async (req, res) => {
-  try {
-    const { date } = req.query; // YYYY-MM-DD
-    if (!date) return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
+// Admin: set opening FX balance for a date
+app.post("/api/balances/open-fx", requireAuth, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
 
-    const bal = await pool.query(
-      `SELECT business_date, opening_balance_mmk, closing_balance_mmk, opened_at, closed_at
-       FROM daily_balances
-       WHERE business_date = $1::date`,
+  try {
+    const { date, currency, openingAmount } = req.body;
+
+    if (!date || !currency || openingAmount === undefined) {
+      return res.status(400).json({ error: "date, currency, openingAmount are required" });
+    }
+
+    const currencyCode = String(currency).trim().toUpperCase();
+    if (!currencyCode) {
+      return res.status(400).json({ error: "currency is required (e.g. USD)" });
+    }
+
+    const amount = Number(openingAmount);
+    if (!Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({ error: "openingAmount must be a number >= 0" });
+    }
+
+    await client.query("BEGIN");
+
+    // Optional: validate currency exists and active
+    const cur = await client.query(
+      `SELECT code FROM currencies WHERE code = $1 AND is_active = true`,
+      [currencyCode]
+    );
+    if (cur.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `Currency ${currencyCode} not found or inactive` });
+    }
+
+    // Lock the daily balance row for the date
+    // NOTE: table name here must match your DB: daily_balances (plural)
+    const bal = await client.query(
+      `
+      SELECT id, closed_at
+      FROM daily_balances
+      WHERE business_date = $1::date
+      FOR UPDATE
+      `,
       [date]
     );
 
-    const totals = await pool.query(
+    if (bal.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Set MMK opening balance first for this date." });
+    }
+
+    if (bal.rows[0].closed_at) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Day is closed. Re-open day before setting FX opening." });
+    }
+
+    const dailyBalanceId = bal.rows[0].id;
+
+    // Upsert FX opening
+    const upsert = await client.query(
+      `
+      INSERT INTO daily_balance_fx (daily_balance_id, currency_code, opening_amount)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (daily_balance_id, currency_code)
+      DO UPDATE SET
+        opening_amount = EXCLUDED.opening_amount,
+        updated_at = NOW()
+      RETURNING currency_code, opening_amount, closing_amount
+      `,
+      [dailyBalanceId, currencyCode, amount]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      date,
+      fx: {
+        currency: upsert.rows[0].currency_code,
+        openingAmount: Number(upsert.rows[0].opening_amount),
+        closingAmount: upsert.rows[0].closing_amount !== null ? Number(upsert.rows[0].closing_amount) : null,
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Admin: set closing FX balance for a date + currency
+app.post("/api/balances/close-fx", requireAuth, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { date, currency, closingAmount } = req.body;
+
+    if (!date || !currency || closingAmount === undefined) {
+      return res.status(400).json({ error: "date, currency, closingAmount are required" });
+    }
+
+    const currencyCode = String(currency).trim().toUpperCase();
+    const amount = Number(closingAmount);
+
+    if (!currencyCode) return res.status(400).json({ error: "currency is required (e.g. USD)" });
+    if (!Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({ error: "closingAmount must be a number >= 0" });
+    }
+
+    await client.query("BEGIN");
+
+    // Ensure currency exists and active (prevents random codes)
+    const cur = await client.query(
+      `SELECT code FROM currencies WHERE code = $1 AND is_active = true`,
+      [currencyCode]
+    );
+    if (cur.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `Currency ${currencyCode} not found or inactive` });
+    }
+
+    // Lock the day row
+    const bal = await client.query(
+      `
+      SELECT id, closed_at
+      FROM daily_balances
+      WHERE business_date = $1::date
+      FOR UPDATE
+      `,
+      [date]
+    );
+
+    if (bal.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Set MMK opening balance first for this date." });
+    }
+
+    const dailyBalanceId = bal.rows[0].id;
+
+    // Require opening exists (so you don't close something never opened)
+    const existingFx = await client.query(
+      `
+      SELECT id
+      FROM daily_balance_fx
+      WHERE daily_balance_id = $1 AND currency_code = $2
+      `,
+      [dailyBalanceId, currencyCode]
+    );
+
+    if (existingFx.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `No FX opening found for ${currencyCode}. Set opening first.` });
+    }
+
+    // Update closing
+    const updated = await client.query(
+      `
+      UPDATE daily_balance_fx
+      SET closing_amount = $3,
+          updated_at = NOW()
+      WHERE daily_balance_id = $1
+        AND currency_code = $2
+      RETURNING currency_code, opening_amount, closing_amount
+      `,
+      [dailyBalanceId, currencyCode, amount]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      date,
+      fx: {
+        currency: updated.rows[0].currency_code,
+        openingAmount: Number(updated.rows[0].opening_amount),
+        closingAmount: Number(updated.rows[0].closing_amount),
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Admin: delete FX row for a date + currency
+app.delete("/api/balances/fx", requireAuth, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { date, currency } = req.query;
+
+    if (!date || !currency) {
+      return res.status(400).json({ error: "date and currency are required" });
+    }
+
+    const currencyCode = String(currency).trim().toUpperCase();
+
+    await client.query("BEGIN");
+
+    // Lock the day row (and block deletes if day is closed)
+    const bal = await client.query(
+      `
+      SELECT id, closed_at
+      FROM daily_balances
+      WHERE business_date = $1::date
+      FOR UPDATE
+      `,
+      [date]
+    );
+
+    if (bal.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "No daily balance for that date" });
+    }
+
+    if (bal.rows[0].closed_at) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Day is closed. Re-open day before deleting FX." });
+    }
+
+    const dailyBalanceId = bal.rows[0].id;
+
+    const del = await client.query(
+      `
+      DELETE FROM daily_balance_fx
+      WHERE daily_balance_id = $1 AND currency_code = $2
+      RETURNING currency_code
+      `,
+      [dailyBalanceId, currencyCode]
+    );
+
+    await client.query("COMMIT");
+
+    if (del.rowCount === 0) {
+      return res.status(404).json({ error: "FX row not found" });
+    }
+
+    res.json({ ok: true, date, deletedCurrency: del.rows[0].currency_code });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// Get balance + totals for a date (suggested closing = opening + received - paid_out)
+app.get("/api/balances", async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
+    }
+
+    // 1️⃣ Daily MMK balance
+    const balResult = await pool.query(
+      `
+      SELECT id, business_date, opening_balance_mmk, closing_balance_mmk, opened_at, closed_at
+      FROM daily_balances
+      WHERE business_date = $1::date
+      `,
+      [date]
+    );
+
+    const balance = balResult.rowCount ? balResult.rows[0] : null;
+
+    // 2️⃣ Transaction totals (DO NOT TOUCH)
+    const totalsResult = await pool.query(
       `
       SELECT
         COALESCE(SUM(CASE WHEN type='BUY'  THEN mmk_amount ELSE 0 END), 0) AS paid_out,
         COALESCE(SUM(CASE WHEN type='SELL' THEN mmk_amount ELSE 0 END), 0) AS received
       FROM transactions
-      WHERE business_date=$1::date
+      WHERE business_date = $1::date
       `,
       [date]
     );
 
-    const paidOut = Number(totals.rows[0].paid_out);
-    const received = Number(totals.rows[0].received);
+    // FX totals from transactions (per currency)
+    const fxTx = await pool.query(
+      `
+      SELECT
+        currency_code,
+        COALESCE(SUM(CASE WHEN type='BUY'  THEN foreign_amount ELSE 0 END), 0) AS foreign_in,
+        COALESCE(SUM(CASE WHEN type='SELL' THEN foreign_amount ELSE 0 END), 0) AS foreign_out
+      FROM transactions
+      WHERE business_date = $1::date
+      GROUP BY currency_code
+      ORDER BY currency_code
+      `,
+      [date]
+    );
 
-    const openingBalance = bal.rowCount ? Number(bal.rows[0].opening_balance_mmk) : null;
-    const suggestedClosing =
-      openingBalance === null ? null : Number((openingBalance + received - paidOut).toFixed(2));
+    const paidOut = Number(totalsResult.rows[0].paid_out);
+    const received = Number(totalsResult.rows[0].received);
 
+    const openingBalanceMMK = balance
+      ? Number(balance.opening_balance_mmk)
+      : null;
+
+    const suggestedClosingMMK =
+      openingBalanceMMK === null
+        ? null
+        : Number((openingBalanceMMK + received - paidOut).toFixed(2));
+
+    // 3️⃣ FX balances (SAFE ADDITION)
+    let fxBalances = [];
+
+    if (balance) {
+      const fxResult = await pool.query(
+        `
+        SELECT
+          currency_code,
+          opening_amount,
+          closing_amount
+        FROM daily_balance_fx
+        WHERE daily_balance_id = $1
+        ORDER BY currency_code
+        `,
+        [balance.id]
+      );
+
+      fxBalances = fxResult.rows.map(row => ({
+        currency: row.currency_code,
+        openingAmount: row.opening_amount === null ? null : Number(row.opening_amount),
+        closingAmount: row.closing_amount !== null
+          ? Number(row.closing_amount)
+          : null,
+      }));
+    }
+
+    // 3.5️⃣ Merge FX transaction totals into fxBalances (+ suggested closing & difference)
+    const fxTotalsByCur = {};
+    for (const r of fxTx.rows) {
+      const cur = r.currency_code;
+      const foreignIn = Number(r.foreign_in);
+      const foreignOut = Number(r.foreign_out);
+      const netForeign = Number((foreignIn - foreignOut).toFixed(2));
+      fxTotalsByCur[cur] = { foreignIn, foreignOut, netForeign };
+    }
+
+    fxBalances = fxBalances.map((fx) => {
+      const t = fxTotalsByCur[fx.currency] || { foreignIn: 0, foreignOut: 0, netForeign: 0 };
+
+      const suggestedClosingAmount =
+        fx.openingAmount === null || fx.openingAmount === undefined
+          ? null
+          : Number((Number(fx.openingAmount) + t.netForeign).toFixed(2));
+
+      const diffAmount =
+        fx.closingAmount === null || fx.closingAmount === undefined || suggestedClosingAmount === null
+          ? null
+          : Number((Number(fx.closingAmount) - suggestedClosingAmount).toFixed(2));
+
+      return {
+        ...fx,
+        foreignIn: t.foreignIn,
+        foreignOut: t.foreignOut,
+        netForeign: t.netForeign,
+        suggestedClosingAmount,
+        diffAmount,
+      };
+    });
+
+    // 4️⃣ Final response
     res.json({
       date,
-      openingBalanceMMK: openingBalance,
-      closingBalanceMMK: bal.rowCount ? bal.rows[0].closing_balance_mmk : null,
-      isClosed: bal.rowCount ? !!bal.rows[0].closed_at : false,
+      openingBalanceMMK,
+      closingBalanceMMK: balance ? balance.closing_balance_mmk : null,
+      isClosed: balance ? !!balance.closed_at : false,
+
       totals: {
         totalMMKReceived: received,
         totalMMKPaidOut: paidOut,
       },
-      suggestedClosingMMK: suggestedClosing,
+
+      suggestedClosingMMK,
+
+      // ✅ FX INCLUDED
+      fxBalances,
     });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -676,6 +1017,36 @@ app.put("/api/admin/currencies/:code", requireAuth, requireRole("admin"), async 
     res.status(500).json({ error: err.message });
   }
 });
+
+// Admin: delete currency (hard delete)
+app.delete("/api/admin/currencies/:code", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const code = String(req.params.code).toUpperCase();
+
+    // Optional: block delete if used in transactions (friendlier message)
+    const used = await pool.query(
+      `SELECT 1 FROM transactions WHERE currency_code = $1 LIMIT 1`,
+      [code]
+    );
+    if (used.rowCount > 0) {
+      return res.status(409).json({
+        error: `Cannot delete ${code} because it is used in transactions. Deactivate it instead.`,
+      });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM currencies WHERE code = $1 RETURNING code`,
+      [code]
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ error: "Currency not found" });
+
+    res.json({ ok: true, deleted: result.rows[0].code });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin: re-open a closed day
 app.post("/api/balances/reopen", requireAuth, requireRole("admin"), async (req, res) => {
   try {

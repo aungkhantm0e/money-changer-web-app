@@ -7,6 +7,7 @@ export default function RatesPage() {
   const [savingCode, setSavingCode] = useState("");
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
+  const [deletingCode, setDeletingCode] = useState("");
 
   // New currency form
   const [newCode, setNewCode] = useState("");
@@ -73,6 +74,25 @@ export default function RatesPage() {
       setSavingCode("");
     }
   }
+
+  async function deleteRow(code) {
+  setError("");
+  setMsg("");
+
+  const ok = window.confirm(`Delete currency ${code}? This cannot be undone.`);
+  if (!ok) return;
+
+  setDeletingCode(code);
+  try {
+    await axios.delete(`/api/admin/currencies/${code}`);
+    setMsg(`Deleted ${code}`);
+    await load();
+  } catch (e) {
+    setError(e?.response?.data?.error || e.message);
+  } finally {
+    setDeletingCode("");
+  }
+}
 
   async function createCurrency(e) {
     e.preventDefault();
@@ -200,15 +220,29 @@ export default function RatesPage() {
                     onChange={(e) => updateRow(r.code, { _active: e.target.checked })}
                   />
                 </td>
-
+                
                 <td style={td}>
-                  <button
-                    onClick={() => saveRow(r.code)}
-                    disabled={!r._dirty || savingCode === r.code}
-                    style={{ padding: "8px 10px", cursor: "pointer" }}
-                  >
-                    {savingCode === r.code ? "Saving…" : "Save"}
-                  </button>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => saveRow(r.code)}
+                      disabled={!r._dirty || savingCode === r.code}
+                      style={{ padding: "8px 10px", cursor: "pointer" }}
+                    >
+                      {savingCode === r.code ? "Saving…" : "Save"}
+                    </button>
+
+                    <button
+                      onClick={() => deleteRow(r.code)}
+                      disabled={deletingCode === r.code}
+                      style={{
+                        padding: "8px 10px",
+                        cursor: "pointer",
+                        background: "#ff0707ff"
+                      }}
+                    >
+                      {deletingCode === r.code ? "Deleting…" : "Delete"}
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
