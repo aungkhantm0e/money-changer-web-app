@@ -136,27 +136,27 @@ export default function NewTransactionPage() {
     return Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
   }
 
-  function openSlipPrintWindow() {
-    setError("");
+ function openSlipPrintWindow() {
+  setError("");
 
-    const msg = validate();
-    if (msg) return setError(msg);
+  const msg = validate();
+  if (msg) return setError(msg);
 
-    if (!savedTxId) return setError("Please Save first, then Print.");
+  if (!savedTxId) return setError("Please Save first, then Print.");
 
-    // Use saved time if available (so the slip matches the saved record)
-    const iso = savedAtISO || getFinalISODateTime();
-    const dt = new Date(iso).toLocaleString();
+  const iso = savedAtISO || getFinalISODateTime();
+  const dt = new Date(iso).toLocaleString();
 
-    const typeLabel =
-      type === "SELL"
-        ? "SELL (Customer buys foreign)"
-        : "BUY (Customer sells foreign)";
+  const typeLabel =
+    type === "SELL"
+      ? "SELL (Customer buys foreign)"
+      : "BUY (Customer sells foreign)";
 
-    const html = `<!doctype html>
+  const html = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Receipt ${savedTxId}</title>
   <style>
     @page { size: 80mm auto; margin: 2mm; }
@@ -167,56 +167,90 @@ export default function NewTransactionPage() {
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
     }
-    .slip { width: 76mm; margin: 0 auto; }
+    .toolbar {
+      position: sticky;
+      top: 0;
+      background: #fff;
+      border-bottom: 1px solid #ddd;
+      padding: 10px;
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      z-index: 2;
+    }
+    .btn {
+      font: inherit;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid #111;
+      background: #111;
+      color: #fff;
+      cursor: pointer;
+    }
+    .btn.secondary { background: #fff; color: #111; }
+    .slip { width: 76mm; margin: 0 auto; padding: 8px 0; }
     .center { text-align: center; }
     .row { display: flex; justify-content: space-between; gap: 8px; }
     .muted { opacity: 0.85; }
     .hr { border-top: 1px dashed #000; margin: 8px 0; }
     .big { font-size: 14px; font-weight: 700; }
+    @media print { .toolbar { display: none !important; } }
   </style>
 </head>
 <body>
+  <div class="toolbar">
+    <button class="btn" id="btnPrint">PRINT</button>
+    <button class="btn secondary" id="btnClose">CLOSE</button>
+  </div>
+
   <div class="slip">
     <div class="center big">Money Changer</div>
-    <div class="center muted">${dt}</div>
+    <div class="center muted">${escapeHtml(dt)}</div>
     <div class="hr"></div>
 
-    <div class="row"><div>Receipt #</div><div><b>${savedTxId}</b></div></div>
-    <div class="row"><div>Business Date</div><div>${bizDate}</div></div>
+    <div class="row"><div>Receipt #</div><div><b>${escapeHtml(savedTxId)}</b></div></div>
+    <div class="row"><div>Business Date</div><div>${escapeHtml(bizDate)}</div></div>
     <div class="row"><div>Type</div><div>${escapeHtml(typeLabel)}</div></div>
     <div class="row"><div>Customer</div><div>${escapeHtml(customerName || "Walk-in")}</div></div>
 
     <div class="hr"></div>
 
     <div class="row"><div>Currency</div><div><b>${escapeHtml(currencyCode)}</b></div></div>
-    <div class="row"><div>Foreign</div><div><b>${money(foreignAmount)}</b></div></div>
-    <div class="row"><div>Rate</div><div>${money(rate)}</div></div>
+    <div class="row"><div>Foreign</div><div><b>${escapeHtml(money(foreignAmount))}</b></div></div>
+    <div class="row"><div>Rate</div><div>${escapeHtml(money(rate))}</div></div>
 
     <div class="hr"></div>
 
-    <div class="row big"><div>MMK</div><div>${money(mmkAmount)}</div></div>
+    <div class="row big"><div>MMK</div><div>${escapeHtml(money(mmkAmount))}</div></div>
 
     <div class="hr"></div>
     <div class="center muted">Thank you</div>
   </div>
 
   <script>
-    window.focus();
-    window.print();
-    window.onafterprint = () => window.close();
+    function doPrint() {
+      try { window.focus(); window.print(); } catch (e) {}
+    }
+    document.getElementById("btnPrint").addEventListener("click", doPrint);
+    document.getElementById("btnClose").addEventListener("click", () => window.close());
+
+    // Auto-print attempt (some Android builds block it — hence the PRINT button)
+    window.addEventListener("load", () => setTimeout(doPrint, 150));
   </script>
 </body>
 </html>`;
 
-    const w = window.open("", "_blank", "width=420,height=640");
-    if (!w) {
-      setError("Popup blocked. Allow popups to print slips.");
-      return;
-    }
-    w.document.open();
-    w.document.write(html);
-    w.document.close();
+  // ✅ Use a new tab instead of a "popup sized window" (Android blocks popups)
+  const w = window.open("", "_blank");
+  if (!w) {
+    setError("Popup blocked. On Android, allow popups for this site OR open in Chrome (not in-app browser).");
+    return;
   }
+
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+}
 
   return (
     <div style={{ maxWidth: 520 }}>
