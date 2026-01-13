@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import "./App.css";
-import { Routes, Route, Link, useNavigate, NavLink } from "react-router-dom";
+import { Routes, Route, Link, useNavigate, NavLink, Navigate, useLocation } from "react-router-dom";
 import axios from "axios";
 import NewTransactionPage from "./pages/NewTransactionPage.jsx";
 import ReceiptPage from "./pages/ReceiptPage.jsx";
@@ -15,6 +15,8 @@ import YearlyReportPage from "./pages/YearlyReportPage.jsx";
 
 export default function App() {
   const [me, setMe] = useState(null);
+  const location = useLocation();
+  const isLoginPage = location.pathname === "/login";
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -34,22 +36,93 @@ export default function App() {
   <div className="app-shell">
     {/* LEFT SIDE: page content */}
     <main className="app-content">
-      <Routes>
-        <Route path="/login" element={<LoginPage onLoggedIn={setMe} />} />
-        <Route path="/" element={me ? <NewTransactionPage /> : <LoginGate />} />
-        <Route path="/receipt/:id" element={me ? <ReceiptPage /> : <LoginGate />} />
-        <Route path="/rates" element={me?.role === "admin" ? <RatesPage /> : <LoginGate />} />
-        <Route path="/transactions" element={me ? <TransactionsPage /> : <LoginGate />} />
-        <Route path="/reports" element={me ? <ReportsPage /> : <LoginGate />} />
-        <Route path="/balances" element={me?.role === "admin" ? <BalancesPage /> : <LoginGate />} />
-        <Route path="/daily-report" element={me ? <DailyReportPage /> : <LoginGate />} />
-        <Route path="/monthly-report" element={me ? <MonthlyReportPage /> : <LoginGate />} />
-        <Route path="/yearly-report" element={me ? <YearlyReportPage /> : <LoginGate />} />
-      </Routes>
+     <Routes>
+      <Route
+        path="/login"
+        element={me ? <Navigate to="/" replace /> : <LoginPage onLoggedIn={setMe} />}
+      />
+
+      <Route
+        path="/"
+        element={
+          <RequireAuth me={me}>
+            <NewTransactionPage />
+          </RequireAuth>
+        }
+      />
+
+      <Route
+        path="/receipt/:id"
+        element={
+          <RequireAuth me={me}>
+            <ReceiptPage />
+          </RequireAuth>
+        }
+      />
+
+      <Route
+        path="/rates"
+        element={
+          me?.role === "admin" ? <RatesPage /> : <Navigate to="/login" replace />
+        }
+      />
+
+      <Route
+        path="/transactions"
+        element={
+          <RequireAuth me={me}>
+            <TransactionsPage />
+          </RequireAuth>
+        }
+      />
+
+      <Route
+        path="/reports"
+        element={
+          <RequireAuth me={me}>
+            <ReportsPage />
+          </RequireAuth>
+        }
+      />
+
+      <Route
+        path="/balances"
+        element={
+          me?.role === "admin" ? <BalancesPage /> : <Navigate to="/login" replace />
+        }
+      />
+
+      <Route
+        path="/daily-report"
+        element={
+          <RequireAuth me={me}>
+            <DailyReportPage />
+          </RequireAuth>
+        }
+      />
+
+      <Route
+        path="/monthly-report"
+        element={
+          <RequireAuth me={me}>
+            <MonthlyReportPage />
+          </RequireAuth>
+        }
+      />
+
+      <Route
+        path="/yearly-report"
+        element={
+          <RequireAuth me={me}>
+            <YearlyReportPage />
+          </RequireAuth>
+        }
+      />
+    </Routes>
     </main>
 
     {/* RIGHT SIDE: stacked nav */}
-    {me ? (
+    {me && !isLoginPage ? (
       <aside className="app-nav">
         <div className="nav-top">
           <h2 className="brand">Money Changer</h2>
@@ -122,10 +195,9 @@ export default function App() {
 );
 }
 
-function LoginGate() {
-  return (
-    <div>
-      Please <Link to="/login">login</Link>.
-    </div>
-  );
+function RequireAuth({ me, children }) {
+  if (!me) {
+    return <Navigate to="/login" replace />;
+  }
+  return children;
 }
