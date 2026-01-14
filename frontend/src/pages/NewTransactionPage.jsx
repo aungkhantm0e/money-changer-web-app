@@ -156,31 +156,46 @@ async function printViaRawBT() {
   const receiptText =
 `Money Changer
 ${dt}
-
+--------------------------------
 Receipt #: ${savedTxId}
 Business Date: ${bizDate}
 Type: ${typeLabel}
 Customer: ${customerName || "Walk-in"}
-
+--------------------------------
 Currency: ${currencyCode}
-Foreign: ${money(foreignAmount)}
-Rate: ${money(rate)}
-
-MMK: ${money(mmkAmount)}
-
+Foreign : ${money(foreignAmount)}
+Rate    : ${money(rate)}
+--------------------------------
+MMK     : ${money(mmkAmount)}
+--------------------------------
 Thank you
 `;
 
+  // 1) Must be supported + secure context (https/localhost)
   if (!navigator.share) {
-    setError("Sharing not supported here. Open the app in Chrome on Android.");
+    setError("Share not supported on this tablet browser. Please open in Chrome (not Mi Browser / not PWA).");
     return;
   }
 
   try {
+    // 2) Try share TEXT only first (works on more Xiaomi/MIUI builds)
+    await navigator.share({
+      title: `Receipt ${savedTxId}`,
+      text: receiptText,
+    });
+    return;
+  } catch (e) {
+    // User cancel is fine
+    if (e?.name === "AbortError") return;
+    // If text-share failed, continue to file-share attempt
+  }
+
+  // 3) Try file share (only if supported)
+  try {
     const file = new File([receiptText], `receipt-${savedTxId}.txt`, { type: "text/plain" });
 
     if (navigator.canShare && !navigator.canShare({ files: [file] })) {
-      setError("This browser can't share files. Try Chrome.");
+      setError("This tablet can’t share files. Use Chrome, or print via RawBT app manually.");
       return;
     }
 
@@ -190,7 +205,8 @@ Thank you
       files: [file],
     });
   } catch (e) {
-    if (e?.name !== "AbortError") setError(e?.message || "Share failed.");
+    if (e?.name === "AbortError") return;
+    setError(e?.message || "Share failed on this tablet. Try Chrome or update system WebView.");
   }
 }
 
