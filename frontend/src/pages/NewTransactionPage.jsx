@@ -123,25 +123,26 @@ export default function NewTransactionPage() {
     }
   }
 
-  function escapeHtml(str) {
-    return String(str ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
+  // function escapeHtml(str) {
+  //   return String(str ?? "")
+  //     .replaceAll("&", "&amp;")
+  //     .replaceAll("<", "&lt;")
+  //     .replaceAll(">", "&gt;")
+  //     .replaceAll('"', "&quot;")
+  //     .replaceAll("'", "&#039;");
+  // }
 
   function money(n) {
     return Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
   }
 
- function openSlipPrintWindow() {
+
+//print via RawBT
+async function printViaRawBT() {
   setError("");
 
   const msg = validate();
   if (msg) return setError(msg);
-
   if (!savedTxId) return setError("Please Save first, then Print.");
 
   const iso = savedAtISO || getFinalISODateTime();
@@ -152,104 +153,61 @@ export default function NewTransactionPage() {
       ? "SELL (Customer buys foreign)"
       : "BUY (Customer sells foreign)";
 
-  const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Receipt ${savedTxId}</title>
-  <style>
-    @page { size: 80mm auto; margin: 2mm; }
-    html, body { padding: 0; margin: 0; }
-    body {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size: 12px;
-      -webkit-print-color-adjust: exact;
-      print-color-adjust: exact;
-    }
-    .toolbar {
-      position: sticky;
-      top: 0;
-      background: #fff;
-      border-bottom: 1px solid #ddd;
-      padding: 10px;
-      display: flex;
-      gap: 10px;
-      justify-content: center;
-      z-index: 2;
-    }
-    .btn {
-      font: inherit;
-      padding: 10px 14px;
-      border-radius: 10px;
-      border: 1px solid #111;
-      background: #111;
-      color: #fff;
-      cursor: pointer;
-    }
-    .btn.secondary { background: #fff; color: #111; }
-    .slip { width: 76mm; margin: 0 auto; padding: 8px 0; }
-    .center { text-align: center; }
-    .row { display: flex; justify-content: space-between; gap: 8px; }
-    .muted { opacity: 0.85; }
-    .hr { border-top: 1px dashed #000; margin: 8px 0; }
-    .big { font-size: 14px; font-weight: 700; }
-    @media print { .toolbar { display: none !important; } }
-  </style>
-</head>
-<body>
-  <div class="toolbar">
-    <button class="btn" id="btnPrint">PRINT</button>
-    <button class="btn secondary" id="btnClose">CLOSE</button>
-  </div>
+  const receiptText =
+`Money Changer
+${dt}
+--------------------------------
+Receipt #: ${savedTxId}
+Business Date: ${bizDate}
+Type: ${typeLabel}
+Customer: ${customerName || "Walk-in"}
+--------------------------------
+Currency: ${currencyCode}
+Foreign : ${money(foreignAmount)}
+Rate    : ${money(rate)}
+--------------------------------
+MMK     : ${money(mmkAmount)}
+--------------------------------
+Thank you
+`;
 
-  <div class="slip">
-    <div class="center big">Money Changer</div>
-    <div class="center muted">${escapeHtml(dt)}</div>
-    <div class="hr"></div>
-
-    <div class="row"><div>Receipt #</div><div><b>${escapeHtml(savedTxId)}</b></div></div>
-    <div class="row"><div>Business Date</div><div>${escapeHtml(bizDate)}</div></div>
-    <div class="row"><div>Type</div><div>${escapeHtml(typeLabel)}</div></div>
-    <div class="row"><div>Customer</div><div>${escapeHtml(customerName || "Walk-in")}</div></div>
-
-    <div class="hr"></div>
-
-    <div class="row"><div>Currency</div><div><b>${escapeHtml(currencyCode)}</b></div></div>
-    <div class="row"><div>Foreign</div><div><b>${escapeHtml(money(foreignAmount))}</b></div></div>
-    <div class="row"><div>Rate</div><div>${escapeHtml(money(rate))}</div></div>
-
-    <div class="hr"></div>
-
-    <div class="row big"><div>MMK</div><div>${escapeHtml(money(mmkAmount))}</div></div>
-
-    <div class="hr"></div>
-    <div class="center muted">Thank you</div>
-  </div>
-
-  <script>
-    function doPrint() {
-      try { window.focus(); window.print(); } catch (e) {}
-    }
-    document.getElementById("btnPrint").addEventListener("click", doPrint);
-    document.getElementById("btnClose").addEventListener("click", () => window.close());
-
-    // Auto-print attempt (some Android builds block it — hence the PRINT button)
-    window.addEventListener("load", () => setTimeout(doPrint, 150));
-  </script>
-</body>
-</html>`;
-
-  // ✅ Use a new tab instead of a "popup sized window" (Android blocks popups)
-  const w = window.open("", "_blank");
-  if (!w) {
-    setError("Popup blocked. On Android, allow popups for this site OR open in Chrome (not in-app browser).");
+  // 1) Must be supported + secure context (https/localhost)
+  if (!navigator.share) {
+    setError("Share not supported on this tablet browser. Please open in Chrome (not Mi Browser / not PWA).");
     return;
   }
 
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
+  try {
+    // 2) Try share TEXT only first (works on more Xiaomi/MIUI builds)
+    await navigator.share({
+      title: `Receipt ${savedTxId}`,
+      text: receiptText,
+    });
+    return;
+  } catch (e) {
+    // User cancel is fine
+    if (e?.name === "AbortError") return;
+    // If text-share failed, continue to file-share attempt
+  }
+
+  // 3) Try file share (only if supported)
+  try {
+    const file = new File([receiptText], `receipt-${savedTxId}.txt`, { type: "text/plain" });
+
+    if (navigator.canShare && !navigator.canShare({ files: [file] })) {
+      setError("This tablet can’t share files. Use Chrome, or print via RawBT app manually.");
+      return;
+    }
+
+    await navigator.share({
+      title: `Receipt ${savedTxId}`,
+      text: "Send to RawBT to print",
+      files: [file],
+    });
+  } catch (e) {
+    if (e?.name === "AbortError") return;
+    setError(e?.message || "Share failed on this tablet. Try Chrome or update system WebView.");
+  }
 }
 
   return (
@@ -356,7 +314,11 @@ export default function NewTransactionPage() {
 
           <button
             type="button"
-            onClick={openSlipPrintWindow}
+            onClick={() => {
+              const isAndroid = /Android/i.test(navigator.userAgent);
+              if (isAndroid) return printViaRawBT();
+              return openSlipPrintWindow();
+            }}
             disabled={dayClosed || !savedTxId}
             style={{ padding: 12, fontSize: 16, cursor: "pointer", flex: 1 }}
             title={!savedTxId ? "Save first to enable printing" : "Print slip"}
