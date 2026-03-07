@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
+import useT from "../useT";
 
 function todayISO() {
   const d = new Date();
@@ -9,7 +10,14 @@ function todayISO() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function formatNumber(n) {
+  const num = Number(n);
+  if (!Number.isFinite(num)) return String(n ?? "-");
+  return num.toLocaleString("en-US");
+}
+
 export default function BalancesPage() {
+  const { t, lang } = useT();
   const [date, setDate] = useState(todayISO());
   const [me, setMe] = useState(null);
 
@@ -17,10 +25,15 @@ export default function BalancesPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // CASH inputs
   const [openingInput, setOpeningInput] = useState("");
   const [closingInput, setClosingInput] = useState("");
 
-  // Active currencies (for showing ALL cards)
+  // MOBILE inputs
+  const [openingMobileInput, setOpeningMobileInput] = useState("");
+  const [closingMobileInput, setClosingMobileInput] = useState("");
+
+  // Active currencies
   const [currencies, setCurrencies] = useState([]);
 
   // FX errors + per-currency inputs
@@ -28,28 +41,76 @@ export default function BalancesPage() {
   const [fxOpeningInputs, setFxOpeningInputs] = useState({});
   const [fxClosingInputs, setFxClosingInputs] = useState({});
 
+  // ✅ per-section success messages (no top)
+  const [cashOpenMsg, setCashOpenMsg] = useState(""); // under cash opening card
+  const [cashCloseMsg, setCashCloseMsg] = useState(""); // under cash closing card
+  const [fxMsgByCur, setFxMsgByCur] = useState({}); // under each FX card {USD:"...", ...}
+
+  function clearMsgs() {
+    setCashOpenMsg("");
+    setCashCloseMsg("");
+    setFxMsgByCur({});
+  }
+
+  function flashCashOpenMsg(text) {
+    setCashOpenMsg(text);
+    window.clearTimeout(flashCashOpenMsg._t);
+    flashCashOpenMsg._t = window.setTimeout(() => setCashOpenMsg(""), 2200);
+  }
+
+  function flashCashCloseMsg(text) {
+    setCashCloseMsg(text);
+    window.clearTimeout(flashCashCloseMsg._t);
+    flashCashCloseMsg._t = window.setTimeout(() => setCashCloseMsg(""), 2200);
+  }
+
+  function flashFxMsg(currency, text) {
+    setFxMsgByCur((p) => ({ ...p, [currency]: text }));
+    flashFxMsg._t = flashFxMsg._t || {};
+    window.clearTimeout(flashFxMsg._t[currency]);
+    flashFxMsg._t[currency] = window.setTimeout(() => {
+      setFxMsgByCur((p) => {
+        const next = { ...p };
+        delete next[currency];
+        return next;
+      });
+    }, 2200);
+  }
+
+  function parseOptionalNumber(raw) {
+    if (raw === undefined || raw === null) return null;
+    const s = String(raw).trim();
+    if (s === "") return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
   async function load() {
     setError("");
     setFxError("");
     setLoading(true);
+    clearMsgs();
 
     try {
       const res = await axios.get(`/api/balances?date=${encodeURIComponent(date)}`);
       setData(res.data);
 
-      // prefill MMK inputs if values exist
+      // prefill CASH inputs
       setOpeningInput(res.data.openingBalanceMMK ?? "");
       setClosingInput(res.data.closingBalanceMMK ?? "");
+
+      // prefill MOBILE inputs
+      setOpeningMobileInput(res.data.openingMobileMMK ?? "");
+      setClosingMobileInput(res.data.closingMobileMMK ?? "");
 
       // prefill FX inputs from API rows
       const list = res.data?.fxBalances ?? [];
       const openMap = {};
       const closeMap = {};
       for (const fx of list) {
-        openMap[fx.currency] = fx.openingAmount ?? 0;
-        closeMap[fx.currency] = fx.closingAmount ?? 0;
+        openMap[fx.currency] = fx.openingAmount ?? "";
+        closeMap[fx.currency] = fx.closingAmount ?? "";
       }
-
       setFxOpeningInputs(openMap);
       setFxClosingInputs(closeMap);
     } catch (e) {
@@ -83,24 +144,55 @@ export default function BalancesPage() {
 
   const isAdmin = me?.role === "admin";
 
-  // Profit/Loss = Actual Closing - Opening (MMK)
-  const profitLoss = useMemo(() => {
+  const cashIn = Number(data?.tenders?.cashIn ?? 0);
+  const cashOut = Number(data?.tenders?.cashOut ?? 0);
+  const mobileIn = Number(data?.tenders?.mobileIn ?? 0);
+  const mobileOut = Number(data?.tenders?.mobileOut ?? 0);
+
+  // CASH Profit/Loss = Actual Closing - Opening
+  const profitLossCash = useMemo(() => {
     if (!data) return null;
-    const opening = data.openingBalanceMMK === null ? null : Number(data.openingBalanceMMK);
-    const closing = data.closingBalanceMMK === null ? null : Number(data.closingBalanceMMK);
+    const opening = data.openingBalanceMMK == null ? null : Number(data.openingBalanceMMK);
+    const closing = data.closingBalanceMMK == null ? null : Number(data.closingBalanceMMK);
     if (opening === null || closing === null) return null;
     if (!Number.isFinite(opening) || !Number.isFinite(closing)) return null;
     return Number((closing - opening).toFixed(2));
   }, [data]);
 
+  // MOBILE Profit/Loss = Actual Closing - Opening
+  const profitLossMobile = useMemo(() => {
+    if (!data) return null;
+    const opening = data.openingMobileMMK == null ? null : Number(data.openingMobileMMK);
+    const closing = data.closingMobileMMK == null ? null : Number(data.closingMobileMMK);
+    if (opening === null || closing === null) return null;
+    if (!Number.isFinite(opening) || !Number.isFinite(closing)) return null;
+    return Number((closing - opening).toFixed(2));
+  }, [data]);
+
+  // ===== CASH actions =====
   async function setOpening() {
     setError("");
-    const opening = Number(openingInput);
-    if (!Number.isFinite(opening)) return setError("Opening must be a number");
+    setFxError("");
+    setCashCloseMsg(""); // only show under correct card
+
+    const openingCash = Number(openingInput);
+    if (!Number.isFinite(openingCash) || openingCash < 0) {
+      return setError("Opening CASH must be a number >= 0");
+    }
+
+    const openingMobile = parseOptionalNumber(openingMobileInput);
+    if (Number.isNaN(openingMobile) || (openingMobile !== null && openingMobile < 0)) {
+      return setError("Opening MOBILE must be a number >= 0 (or leave blank)");
+    }
 
     try {
-      await axios.post("/api/balances/open", { date, openingBalanceMMK: opening });
+      await axios.post("/api/balances/open", {
+        date,
+        openingBalanceMMK: openingCash,
+        openingMobileMMK: openingMobile, // null ok
+      });
       await load();
+      flashCashOpenMsg("✅ Opening saved");
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
     }
@@ -108,20 +200,48 @@ export default function BalancesPage() {
 
   async function closeDay() {
     setError("");
+    setFxError("");
+    setCashOpenMsg("");
 
     if (!data) return setError("No balance data loaded");
-    if (data.openingBalanceMMK === null) return setError("Set opening balance first.");
+    if (data.openingBalanceMMK == null) return setError("Set opening CASH first.");
 
-    const useSuggested = String(closingInput).trim() === "";
-    const closingValue = useSuggested ? Number(data.suggestedClosingMMK) : Number(closingInput);
+    // ✅ If blank => use suggested closing
+    const closingCashParsed = parseOptionalNumber(closingInput);
+    const suggestedCash = data?.suggestedClosingMMK ?? null;
+    const closingCash =
+      closingCashParsed === null ? (suggestedCash == null ? NaN : Number(suggestedCash)) : closingCashParsed;
 
-    if (!Number.isFinite(closingValue)) {
-      return setError(useSuggested ? "Suggested closing is not available." : "Closing must be a number");
+    if (!Number.isFinite(closingCash) || closingCash < 0) {
+      return setError(
+        suggestedCash == null
+          ? "Closing CASH is required (no suggested cash closing available)."
+          : "Closing CASH must be a number >= 0 (or leave blank to use suggested)."
+      );
+    }
+
+    // ✅ Mobile: blank => suggested mobile (if exists), otherwise null
+    const closingMobileParsed = parseOptionalNumber(closingMobileInput);
+    const suggestedMobile = data?.suggestedClosingMobileMMK ?? null;
+    const closingMobile =
+      closingMobileParsed === null
+        ? suggestedMobile == null
+          ? null
+          : Number(suggestedMobile)
+        : closingMobileParsed;
+
+    if (Number.isNaN(closingMobile) || (closingMobile !== null && closingMobile < 0)) {
+      return setError("Closing MOBILE must be a number >= 0 (or leave blank to use suggested/empty).");
     }
 
     try {
-      await axios.post("/api/balances/close", { date, closingBalanceMMK: closingValue });
+      await axios.post("/api/balances/close", {
+        date,
+        closingBalanceMMK: closingCash,
+        closingMobileMMK: closingMobile, // null ok
+      });
       await load();
+      flashCashCloseMsg("✅ Day closed (closing saved)");
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
     }
@@ -129,19 +249,22 @@ export default function BalancesPage() {
 
   async function reopenDay() {
     setError("");
+    setFxError("");
     try {
       await axios.post("/api/balances/reopen", { date });
       await load();
+      flashCashCloseMsg("✅ Day re-opened");
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
     }
   }
 
-  // ===== FX card actions =====
-
+  // ===== FX actions =====
   async function saveFxOpening(currency) {
     setFxError("");
-    const raw = fxOpeningInputs[currency] ?? 0;
+    setError("");
+
+    const raw = fxOpeningInputs[currency];
     const amount = Number(raw);
 
     if (!Number.isFinite(amount) || amount < 0) {
@@ -151,6 +274,7 @@ export default function BalancesPage() {
     try {
       await axios.post("/api/balances/open-fx", { date, currency, openingAmount: amount });
       await load();
+      flashFxMsg(currency, "✅ Opening saved");
     } catch (e) {
       setFxError(e?.response?.data?.error || e.message);
     }
@@ -158,36 +282,46 @@ export default function BalancesPage() {
 
   async function saveFxClosing(currency) {
     setFxError("");
-    const raw = fxClosingInputs[currency] ?? 0;
-    const amount = Number(raw);
+    setError("");
+
+    // ✅ if blank => use suggestedClosingAmount (if exists)
+    const parsed = parseOptionalNumber(fxClosingInputs[currency]);
+    const fx = (data?.fxBalances ?? []).find((x) => x.currency === currency);
+    const suggested = fx?.suggestedClosingAmount ?? null;
+
+    const amount = parsed === null ? (suggested == null ? NaN : Number(suggested)) : parsed;
 
     if (!Number.isFinite(amount) || amount < 0) {
-      return setFxError("Closing must be a number >= 0");
+      return setFxError(
+        suggested == null
+          ? `No suggested closing for ${currency}. Enter a closing amount first.`
+          : "Closing must be a number >= 0 (or leave blank to use suggested)."
+      );
     }
 
     try {
       await axios.post("/api/balances/close-fx", { date, currency, closingAmount: amount });
       await load();
+      flashFxMsg(currency, "✅ Closing saved");
     } catch (e) {
       setFxError(e?.response?.data?.error || e.message);
     }
   }
 
-  // ===== Build cards for ALL currencies =====
+  // ===== Build cards for ALL active currencies =====
   const fxBalances = data?.fxBalances ?? [];
 
   const fxCards = currencies.map((c) => {
     const existing = fxBalances.find((x) => x.currency === c.code);
 
     const openingAmount = existing?.openingAmount ?? 0;
-    const closingAmount = existing?.closingAmount ?? 0;
+    const closingAmount = existing?.closingAmount ?? null;
+
     const foreignIn = existing?.foreignIn ?? 0;
     const foreignOut = existing?.foreignOut ?? 0;
     const netForeign = existing?.netForeign ?? Number((foreignIn - foreignOut).toFixed(2));
-    const suggestedClosingAmount =
-      existing?.suggestedClosingAmount ?? Number((openingAmount + netForeign).toFixed(2));
-    const diffAmount =
-      existing?.diffAmount ?? Number((closingAmount - suggestedClosingAmount).toFixed(2));
+
+    const suggestedClosingAmount = existing?.suggestedClosingAmount ?? null;
 
     return {
       currency: c.code,
@@ -198,206 +332,350 @@ export default function BalancesPage() {
       foreignOut,
       netForeign,
       suggestedClosingAmount,
-      diffAmount,
     };
   });
 
   return (
-    <div style={{ maxWidth: 900 }}>
-      <h3 style={{ marginTop: 0 }}>Balances</h3>
+    <div className="bal-page">
+      {/* Header */}
+      <div className="bal-header">
+        <div>
+          <h1 className="bal-title">{t("balances")}</h1>
+          <div className="bal-subtitle">Daily open/close</div>
+        </div>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
-        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          Date:
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-        </label>
+        <div className="bal-controls">
+          <label className="bal-date">
+            <span>{t("date")}</span>
+            <input className="tx-input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </label>
 
-        <button onClick={load} style={{ padding: "8px 10px", cursor: "pointer" }}>
-          Refresh
-        </button>
+          <button onClick={load} className="tx-btn tx-btn--ghost" type="button" disabled={loading} title="Refresh">
+            {loading ? "Refreshing…" : "Refresh"}
+          </button>
 
-        {data?.isClosed ? (
-          <span style={{ padding: "6px 10px", borderRadius: 999, background: "red", color: "white" }}>
-            <b>CLOSED</b>
-          </span>
-        ) : (
-          <span style={{ padding: "6px 10px", borderRadius: 999, background: "#00fd1eff", color: "black" }}>
-            <b>OPEN</b>
-          </span>
-        )}
+          {data?.isClosed ? (
+            <span className="bal-pill bal-pill--closed">
+              <b>CLOSED</b>
+            </span>
+          ) : (
+            <span className="bal-pill bal-pill--open">
+              <b>OPEN</b>
+            </span>
+          )}
+        </div>
       </div>
 
-      {error ? <div style={{ color: "crimson", marginBottom: 10 }}>{error}</div> : null}
-      {loading ? <div>Loading…</div> : null}
+      {/* Alerts (errors only) */}
+      {error ? (
+        <div className="tx-alert tx-alert--danger">
+          <div className="tx-alert__title">Couldn’t load / save balances</div>
+          <div className="tx-alert__body">{error}</div>
+        </div>
+      ) : null}
+
+      {loading ? (
+        <div className="bal-loading mc-card">
+          <div className="bal-loading__title">Loading…</div>
+          <div className="bal-loading__sub">Fetching balances and FX positions.</div>
+        </div>
+      ) : null}
 
       {data ? (
         <>
-          {/* FX Cards - ALL currencies */}
-          <div style={{ marginBottom: 16 }}>
-            <h4 style={{ marginTop: 0 }}>FX Balances</h4>
-            {fxError ? <div style={{ color: "crimson", marginBottom: 10 }}>{fxError}</div> : null}
+          {/* MMK KPIs (CASH + MOBILE) */}
+          <div className="bal-kpis">
+            {/* CASH */}
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("openingMMK")}</div>
+              <div className="bal-kpi__value">{formatNumber(data.openingBalanceMMK ?? "-")}</div>
+            </div>
 
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-              {fxCards.map((fx) => (
-                <div key={fx.currency} style={{ ...card, minWidth: 300 }}>
-                  <div style={small}>
-                    {fx.currency} — {fx.name}
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("mmkreceived")}</div>
+              <div className="bal-kpi__value">{formatNumber(cashIn)}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("mmkpaidout")}</div>
+              <div className="bal-kpi__value">{formatNumber(cashOut)}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("closingMMK")}</div>
+              <div className="bal-kpi__value">{formatNumber(data.closingBalanceMMK ?? "-")}</div>
+            </div>
+
+            {/* MOBILE */}
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("openingMMKmobile")}</div>
+              <div className="bal-kpi__value">{formatNumber(data.openingMobileMMK ?? "-")}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("mmkreceivedmobile")}</div>
+              <div className="bal-kpi__value">{formatNumber(mobileIn)}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("mmkpaidoutmobile")}</div>
+              <div className="bal-kpi__value">{formatNumber(mobileOut)}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("closingMMKmobile")}</div>
+              <div className="bal-kpi__value">{formatNumber(data.closingMobileMMK ?? "-")}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("pl")}</div>
+              <div className={"bal-kpi__value " + (profitLossCash == null ? "" : profitLossCash < 0 ? "bal-neg" : "bal-pos")}>
+                {profitLossCash == null ? "-" : formatNumber(profitLossCash)}
+              </div>
+              <div className="bal-kpi__hint">{t("greenP")}, {t("redL")}</div>
+            </div>
+
+            <div className="mc-card bal-kpi">
+              <div className="bal-kpi__label">{t("plmobile")}</div>
+              <div className={"bal-kpi__value " + (profitLossMobile == null ? "" : profitLossMobile < 0 ? "bal-neg" : "bal-pos")}>
+                {profitLossMobile == null ? "-" : formatNumber(profitLossMobile)}
+              </div>
+              <div className="bal-kpi__hint">{t("greenP")}, {t("redL")}</div>
+            </div>
+          </div>
+
+          {/* FX Balances */}
+          <div className="bal-section">
+            <div className="bal-section-head">
+              <div>
+                <div className="bal-section-title">{t("fx_balances")}</div>
+                <div className="bal-section-sub">Track foreign openings/closings and movement.</div>
+              </div>
+            </div>
+
+            {fxError ? (
+              <div className="tx-alert tx-alert--danger">
+                <div className="tx-alert__title">FX Error</div>
+                <div className="tx-alert__body">{fxError}</div>
+              </div>
+            ) : null}
+
+            <div className="bal-fx-grid">
+              {fxCards.map((fx) => {
+                return (
+                  <div key={fx.currency} className="mc-card bal-fx-card">
+                    <div className="bal-fx-top">
+                      <div>
+                        <div className="bal-fx-code">
+                          {fx.currency} <span className="bal-fx-name">— {fx.name}</span>
+                        </div>
+                        <div className="bal-fx-meta">Net = In (BUY) - Out (SELL)</div>
+                      </div>
+                    </div>
+
+                    <div className="bal-fx-inputs">
+                      <label className="bal-field">
+                        <span>Opening</span>
+                        <input
+                          className="tx-input tx-input--sm mono"
+                          type="number"
+                          value={fxOpeningInputs[fx.currency] ?? fx.openingAmount}
+                          onChange={(e) => setFxOpeningInputs((p) => ({ ...p, [fx.currency]: e.target.value }))}
+                          disabled={!isAdmin || !!data.isClosed}
+                        />
+                      </label>
+
+                      <label className="bal-field">
+                        <span>Closing</span>
+                        <input
+                          className="tx-input tx-input--sm mono"
+                          type="number"
+                          value={fxClosingInputs[fx.currency] ?? (fx.closingAmount ?? "")}
+                          onChange={(e) => setFxClosingInputs((p) => ({ ...p, [fx.currency]: e.target.value }))}
+                          placeholder={fx.suggestedClosingAmount == null ? "" : `Suggested: ${fx.suggestedClosingAmount}`}
+                          disabled={!isAdmin || !!data.isClosed}
+                        />
+                      </label>
+                    </div>
+
+                    {/* suggested hint */}
+                    {fx.suggestedClosingAmount != null ? (
+                      <div className="bal-footnote">
+                        Suggested closing: <b className="mono">{formatNumber(fx.suggestedClosingAmount)}</b>
+                        {" "}• leave blank to use suggested
+                      </div>
+                    ) : (
+                      <div className="bal-footnote">Record opening and closing carefully.</div>
+                    )}
+
+                    {isAdmin ? (
+                      <div className="bal-fx-actions">
+                        <button
+                          onClick={() => saveFxOpening(fx.currency)}
+                          className="tx-btn tx-btn--ghost"
+                          type="button"
+                          disabled={!!data.isClosed}
+                        >
+                          {t("saveOpening")}
+                        </button>
+
+                        <button
+                          onClick={() => saveFxClosing(fx.currency)}
+                          className="tx-btn tx-btn--primary"
+                          type="button"
+                          disabled={!!data.isClosed}
+                        >
+                          {t("saveClosing")}
+                        </button>
+
+                        {/* ✅ per-card success */}
+                        {fxMsgByCur[fx.currency] ? (
+                          <div style={{ marginTop: 10 }} className="rp-alert rp-alert--ok">
+                            <div className="rp-alert__body">{fxMsgByCur[fx.currency]}</div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    <div className="bal-fx-stats">
+                      <div className="bal-stat">
+                        <span>In (BUY)</span>
+                        <b className="mono">{formatNumber(fx.foreignIn)}</b>
+                      </div>
+                      <div className="bal-stat">
+                        <span>Out (SELL)</span>
+                        <b className="mono">{formatNumber(fx.foreignOut)}</b>
+                      </div>
+                      <div className="bal-stat">
+                        <span>Net</span>
+                        <b className="mono">{formatNumber(fx.netForeign)}</b>
+                      </div>
+                    </div>
                   </div>
+                );
+              })}
+            </div>
+          </div>
 
-                  {/* Opening / Closing inputs */}
-                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 10 }}>
-                    <label style={{ ...lbl, width: 130 }}>
-                      Opening
-                      <input
-                        type="number"
-                        value={fxOpeningInputs[fx.currency] ?? fx.openingAmount}
-                        onChange={(e) =>
-                          setFxOpeningInputs((p) => ({ ...p, [fx.currency]: e.target.value }))
-                        }
-                        style={{ ...inp, width: 130 }}
-                        disabled={!isAdmin || !!data.isClosed}
-                      />
-                    </label>
+          {/* Admin actions */}
+          {isAdmin ? (
+            <div className="mc-card bal-admin">
+              <div className="bal-admin-head">
+                <div>
+                  <div className="bal-section-title">Admin Actions</div>
+                  <div className="bal-section-sub">Set opening & close/re-open day (Cash + Mobile).</div>
+                </div>
 
-                    <label style={{ ...lbl, width: 130 }}>
-                      Closing
-                      <input
-                        type="number"
-                        value={fxClosingInputs[fx.currency] ?? fx.closingAmount}
-                        onChange={(e) =>
-                          setFxClosingInputs((p) => ({ ...p, [fx.currency]: e.target.value }))
-                        }
-                        style={{ ...inp, width: 130 }}
-                        disabled={!isAdmin || !!data.isClosed}
-                      />
-                    </label>
-                  </div>
+                {data?.isClosed ? (
+                  <span className="bal-pill bal-pill--closed"><b>CLOSED</b></span>
+                ) : (
+                  <span className="bal-pill bal-pill--open"><b>OPEN</b></span>
+                )}
+              </div>
 
-                  {/* Buttons */}
-                  {isAdmin ? (
-                    <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                      <button onClick={() => saveFxOpening(fx.currency)} style={btn} disabled={!!data.isClosed}>
-                        Save Opening
-                      </button>
-                      <button onClick={() => saveFxClosing(fx.currency)} style={btn} disabled={!!data.isClosed}>
-                        Save Closing
-                      </button>
+              <div className="bal-admin-grid">
+                {/* OPENING */}
+                <div className="bal-admin-block">
+                  <label className="bal-field">
+                    <span>{lang === "mm" ? "ယနေ့အတွက် အဖွင့်ငွေ" : "Set opening CASH (MMK)"}</span>
+                    <input
+                      className="tx-input mono"
+                      type="number"
+                      value={openingInput}
+                      onChange={(e) => setOpeningInput(e.target.value)}
+                      placeholder="e.g. 12000000"
+                      disabled={!!data.isClosed}
+                    />
+                  </label>
+
+                  <label className="bal-field">
+                    <span>{lang === "mm" ? "Mobile banking အတွက်အဖွင့်ငွေ" : "Set opening mobile (MMK)"}</span>
+                    <input
+                      className="tx-input mono"
+                      type="number"
+                      value={openingMobileInput}
+                      onChange={(e) => setOpeningMobileInput(e.target.value)}
+                      placeholder={lang === "mm" ? "Blank ထားလို့ရပါတယ် mobile banking အတွက် မထည့်ဖြစ်ဘူးဆိုရင်" : "Leave blank if not tracking"}
+                      disabled={!!data.isClosed}
+                    />
+                  </label>
+
+                  <button onClick={setOpening} className="tx-btn tx-btn--primary" type="button" disabled={!!data.isClosed}>
+                    {t("saveOpening")}
+                  </button>
+
+                  {/* ✅ success under opening card */}
+                  {cashOpenMsg ? (
+                    <div style={{ marginTop: 10 }} className="rp-alert rp-alert--ok">
+                      <div className="rp-alert__body">{cashOpenMsg}</div>
                     </div>
                   ) : null}
-
-                  {/* Totals */}
-                  <div style={{ marginTop: 12, borderTop: "1px solid #eee", paddingTop: 10 }}>
-                    <div style={small}>
-                      In (BUY): <b>{fx.foreignIn}</b>
-                    </div>
-                    <div style={small}>
-                      Out (SELL): <b>{fx.foreignOut}</b>
-                    </div>
-                    <div style={small}>
-                      Suggested Closing: <b>{fx.suggestedClosingAmount}</b>
-                    </div>
-                    <div style={small}>
-                      Difference:{" "}
-                      <b style={{ color: fx.diffAmount < 0 ? "crimson" : fx.diffAmount > 0 ? "green" : "inherit" }}>
-                        {fx.diffAmount}
-                      </b>
-                    </div>
-                    <div style={{ fontSize: 12, opacity: 0.7 }}>green = over, red = short</div>
-                  </div>
                 </div>
-              ))}
-            </div>
-          </div>
 
-          {/* MMK cards */}
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-            <div style={card}>
-              <div style={small}>Opening Balance (MMK)</div>
-              <div style={big}>{data.openingBalanceMMK ?? "-"}</div>
-            </div>
+                {/* CLOSING */}
+                <div className="bal-admin-block">
+                  <label className="bal-field">
+                    <span>{lang === "mm" ? "ယနေ့အတွက်အပိတ်ငွေ" : "Close day CASH (MMK)"}</span>
+                    <input
+                      className="tx-input mono"
+                      type="number"
+                      value={closingInput}
+                      onChange={(e) => setClosingInput(e.target.value)}
+                      placeholder={
+                        data?.suggestedClosingMMK == null
+                          ? "e.g. 13000000"
+                          : `Suggested: ${data.suggestedClosingMMK}`
+                      }
+                      disabled={!!data.isClosed}
+                    />
+                  </label>
 
-            <div style={card}>
-              <div style={small}>MMK Received (SELL)</div>
-              <div style={big}>{data.totals.totalMMKReceived}</div>
-            </div>
+                  <label className="bal-field">
+                    <span>{lang === "mm" ? "Mobile banking အတွက်အပိတ်ငွေ" : "Close day MOBILE (MMK) (optional)"}</span>
+                    <input
+                      className="tx-input mono"
+                      type="number"
+                      value={closingMobileInput}
+                      onChange={(e) => setClosingMobileInput(e.target.value)}
+                      placeholder={
+                        data?.suggestedClosingMobileMMK == null
+                          ? (lang === "mm" ? "Blank ထားလို့ရပါတယ် mobile banking အတွက် မထည့်ဖြစ်ဘူးဆိုရင်" : "Leave blank if not tracking")
+                          : `Suggested: ${data.suggestedClosingMobileMMK}`
+                      }
+                      disabled={!!data.isClosed}
+                    />
+                  </label>
 
-            <div style={card}>
-              <div style={small}>MMK Paid Out (BUY)</div>
-              <div style={big}>{data.totals.totalMMKPaidOut}</div>
-            </div>
+                  <div className="bal-admin-actions">
+                    <button onClick={closeDay} className="tx-btn tx-btn--danger" type="button" disabled={!!data.isClosed}>
+                      {t("closeDay")}
+                    </button>
 
-            <div style={card}>
-              <div style={small}>Suggested Closing (MMK)</div>
-              <div style={big}>{data.suggestedClosingMMK ?? "-"}</div>
-            </div>
+                    <button onClick={reopenDay} className="tx-btn tx-btn--ghost" type="button" disabled={!data.isClosed}>
+                      {t("reopenDay")}
+                    </button>
+                  </div>
 
-            <div style={card}>
-              <div style={small}>Actual Closing (MMK)</div>
-              <div style={big}>{data.closingBalanceMMK ?? "-"}</div>
-            </div>
+                  <div className="bal-hint">
+                    {lang === "mm"
+                      ? "Closing ကို Blank ထားရင် Suggested closing နဲ့ပိတ်ပေးပါမယ်"
+                      : "If Closing is blank, it will close using the Suggested Closing (if available)."}
+                  </div>
 
-            <div style={card}>
-              <div style={small}>Profit / Loss (Closing − Opening)</div>
-              <div style={{ ...big, color: profitLoss === null ? "inherit" : profitLoss < 0 ? "crimson" : "green" }}>
-                {profitLoss === null ? "-" : profitLoss}
-              </div>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>green = profit, red = loss</div>
-            </div>
-          </div>
-
-          {/* Admin actions (MMK only now) */}
-          {isAdmin ? (
-            <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12 }}>
-              <h4 style={{ marginTop: 0 }}>Admin Actions</h4>
-
-              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end" }}>
-                <label style={lbl}>
-                  Set opening (MMK)
-                  <input
-                    type="number"
-                    value={openingInput}
-                    onChange={(e) => setOpeningInput(e.target.value)}
-                    style={inp}
-                  />
-                </label>
-
-                <button onClick={setOpening} style={btn}>
-                  Save Opening
-                </button>
-
-                <div style={{ width: 16 }} />
-
-                <label style={lbl}>
-                  Close day (MMK)
-                  <input
-                    type="number"
-                    value={closingInput}
-                    onChange={(e) => setClosingInput(e.target.value)}
-                    style={inp}
-                  />
-                </label>
-
-                <button onClick={closeDay} style={btn} disabled={!!data.isClosed}>
-                  Close Day
-                </button>
-
-                <button onClick={reopenDay} style={btn} disabled={!data.isClosed}>
-                  Re-open Day
-                </button>
+                  {/* ✅ success under closing card */}
+                  {cashCloseMsg ? (
+                    <div style={{ marginTop: 10 }} className="rp-alert rp-alert--ok">
+                      <div className="rp-alert__body">{cashCloseMsg}</div>
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
           ) : (
-            <div style={{ opacity: 0.7 }}>Only admin can set opening/closing balances.</div>
+            <div className="bal-muted">Only admin can set opening/closing balances.</div>
           )}
         </>
       ) : null}
     </div>
   );
 }
-
-const card = { border: "1px solid #ddd", borderRadius: 10, padding: 12, minWidth: 220 };
-const small = { fontSize: 12, opacity: 0.7 };
-const big = { fontSize: 18, fontWeight: 700 };
-const lbl = { display: "grid", gap: 6 };
-const inp = { padding: 8, width: 260 };
-const btn = { padding: "10px 12px", cursor: "pointer" };

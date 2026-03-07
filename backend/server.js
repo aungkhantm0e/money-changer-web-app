@@ -55,6 +55,115 @@ function requireRole(...roles) {
   };
 }
 
+//helper function to calculate availableMMK
+async function getAvailableMMK(client, businessDate, tenderMethod) {
+  // tenderMethod: 'CASH_MMK' or 'MOBILE_BANKING'
+  const openingCol =
+    tenderMethod === "MOBILE_BANKING"
+      ? "opening_mobile_mmk"
+      : "opening_balance_mmk";
+
+  const q = `
+    SELECT
+      COALESCE(db.${openingCol}, 0)
+
+      + COALESCE((
+          SELECT SUM(
+            CASE
+              WHEN cm.direction = 'IN' THEN cm.amount
+              WHEN cm.direction = 'OUT' THEN -cm.amount
+              ELSE 0
+            END
+          )
+          FROM cash_movements cm
+          WHERE cm.business_date = db.business_date
+            AND cm.tender_method = $2
+        ), 0)
+
+      + COALESCE((
+          SELECT SUM(
+            CASE
+              WHEN t.type = 'SELL' THEN tp.amount_mmk
+              WHEN t.type = 'BUY'  THEN -tp.amount_mmk
+              ELSE 0
+            END
+          )
+          FROM transaction_payments tp
+          JOIN transactions t
+            ON t.id = tp.transaction_id
+          WHERE t.business_date = db.business_date
+            AND tp.method = $2
+        ), 0)
+
+      AS available_mmk
+    FROM daily_balances db
+    WHERE db.business_date = $1::date
+  `;
+
+  const r = await client.query(q, [businessDate, tenderMethod]);
+
+  if (r.rowCount === 0) {
+    return { exists: false, available: 0 };
+  }
+
+  return {
+    exists: true,
+    available: Number(r.rows[0].available_mmk),
+  };
+}
+
+async function getAvailableFX(client, businessDate, currencyCode) {
+  const q = `
+    SELECT
+      COALESCE(fx.opening_amount, 0)
+
+      + COALESCE((
+          SELECT SUM(
+            CASE
+              WHEN cm.direction = 'IN' THEN cm.amount
+              WHEN cm.direction = 'OUT' THEN -cm.amount
+              ELSE 0
+            END
+          )
+          FROM cash_movements cm
+          WHERE cm.business_date = db.business_date
+            AND cm.tender_method = 'FX'
+            AND cm.currency_code = $2
+        ), 0)
+
+      + COALESCE((
+          SELECT SUM(
+            CASE
+              WHEN t.type = 'BUY' THEN t.foreign_amount
+              WHEN t.type = 'SELL' THEN -t.foreign_amount
+              ELSE 0
+            END
+          )
+          FROM transactions t
+          WHERE t.business_date = db.business_date
+            AND t.currency_code = $2
+        ), 0)
+
+      AS available_fx
+    FROM daily_balances db
+    JOIN daily_balance_fx fx
+      ON fx.daily_balance_id = db.id
+    WHERE db.business_date = $1::date
+      AND fx.currency_code = $2
+  `;
+
+  const r = await client.query(q, [businessDate, currencyCode]);
+
+  if (r.rowCount === 0) {
+    return { exists: false, available: 0 };
+  }
+
+  return {
+    exists: true,
+    available: Number(r.rows[0].available_fx),
+  };
+}
+
 // Quick health check
 app.get("/health", async (req, res) => {
   try {
@@ -131,58 +240,431 @@ function localDateISO() {
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`; // local server date
 }
-// Create a transaction (BUY/SELL) and calculate MMK amount
-app.post("/api/transactions", requireAuth, async (req, res) => {
-  try {
-    const { type, currencyCode, foreignAmount, customerName } = req.body;
-    const createdBy=req.user.username
-    const businessDate = localDateISO() // YYYY-MM-DD (server time)
 
-    // check if day is closed
-    const closed = await pool.query(
+app.get("/api/inventory", requireAuth, async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
+    }
+
+    // 1) MMK availability
+    const cashAvail = await getAvailableMMK(pool, date, "CASH_MMK");
+    const mobileAvail = await getAvailableMMK(pool, date, "MOBILE_BANKING");
+
+    // 2) get all active currencies
+    const curRes = await pool.query(
+      `SELECT code, name
+       FROM currencies
+       WHERE is_active = true
+       ORDER BY code`
+    );
+
+    const fx = [];
+
+    for (const c of curRes.rows) {
+      const fxRes = await pool.query(
+        `
+        SELECT
+          COALESCE(fx.opening_amount, 0)
+
+          + COALESCE((
+              SELECT SUM(
+                CASE
+                  WHEN cm.direction = 'IN' THEN cm.amount
+                  WHEN cm.direction = 'OUT' THEN -cm.amount
+                  ELSE 0
+                END
+              )
+              FROM cash_movements cm
+              WHERE cm.business_date = db.business_date
+                AND cm.tender_method = 'FX'
+                AND cm.currency_code = $2
+            ), 0)
+
+          + COALESCE((
+              SELECT SUM(
+                CASE
+                  WHEN t.type = 'BUY' THEN t.foreign_amount
+                  WHEN t.type = 'SELL' THEN -t.foreign_amount
+                  ELSE 0
+                END
+              )
+              FROM transactions t
+              WHERE t.business_date = db.business_date
+                AND t.currency_code = $2
+            ), 0)
+
+          AS available_fx
+        FROM daily_balances db
+        LEFT JOIN daily_balance_fx fx
+          ON fx.daily_balance_id = db.id
+         AND fx.currency_code = $2
+        WHERE db.business_date = $1::date
+        `,
+        [date, c.code]
+      );
+
+      const available =
+        fxRes.rowCount === 0 ? 0 : Number(fxRes.rows[0].available_fx ?? 0);
+
+      fx.push({
+        currency: c.code,
+        name: c.name,
+        available,
+      });
+    }
+
+    res.json({
+      date,
+      mmk: {
+        cash: cashAvail.exists ? cashAvail.available : 0,
+        mobile: mobileAvail.exists ? mobileAvail.available : 0,
+      },
+      fx,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/balances/available", requireAuth, async (req, res) => {
+  const { date } = req.query;
+
+  if (!date) {
+    return res.status(400).json({ error: "date query param required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        db.business_date,
+
+        db.opening_balance_mmk
+
+        + COALESCE((
+            SELECT SUM(
+              CASE
+                WHEN direction = 'IN' THEN amount
+                WHEN direction = 'OUT' THEN -amount
+              END
+            )
+            FROM cash_movements cm
+            WHERE cm.business_date = db.business_date
+              AND cm.tender_method = 'CASH_MMK'
+          ), 0)
+
+        + COALESCE((
+            SELECT SUM(
+              CASE
+                WHEN t.type = 'SELL' THEN t.mmk_amount
+                WHEN t.type = 'BUY'  THEN -t.mmk_amount
+              END
+            )
+            FROM transactions t
+            WHERE t.business_date = db.business_date
+          ), 0)
+
+        AS available_mmk
+
+      FROM daily_balances db
+      WHERE db.business_date = $1::date
+      `,
+      [date]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "No opening balance for that date." });
+    }
+
+    res.json({
+      businessDate: result.rows[0].business_date,
+      availableMMK: Number(result.rows[0].available_mmk),
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/cash-movements", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    // 🔐 only admin can top-up
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Only admin can create cash movements." });
+    }
+
+    const {
+      businessDate,
+      dateTime,
+      tenderMethod,
+      currencyCode,
+      amount,
+      direction,
+      reason,
+      referenceNo,
+    } = req.body;
+
+    // --- Basic validation ---
+    if (!businessDate) {
+      return res.status(400).json({ error: "businessDate required" });
+    }
+
+    if (!dateTime) {
+      return res.status(400).json({ error: "dateTime required" });
+    }
+
+    const dt = new Date(dateTime);
+    if (Number.isNaN(dt.getTime())) {
+      return res.status(400).json({ error: "Invalid dateTime" });
+    }
+
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: "Amount must be positive number" });
+    }
+
+    const method = String(tenderMethod || "").toUpperCase();
+    const dir = String(direction || "").toUpperCase();
+
+    if (!["CASH_MMK", "MOBILE_BANKING", "FX"].includes(method)) {
+      return res.status(400).json({ error: "Invalid tenderMethod" });
+    }
+
+    if (!["IN", "OUT"].includes(dir)) {
+      return res.status(400).json({ error: "Invalid direction" });
+    }
+
+    // Block if day is closed
+    const closed = await client.query(
       `SELECT closed_at FROM daily_balances WHERE business_date = $1::date`,
       [businessDate]
     );
 
     if (closed.rowCount && closed.rows[0].closed_at) {
-      return res.status(403).json({ error: `Day ${businessDate} is closed. Ask admin to re-open.` });
-    }
-    if (!type || !currencyCode || foreignAmount === undefined) {
-      return res.status(400).json({ error: "type, currencyCode, foreignAmount are required" });
+      return res.status(403).json({ error: `Day ${businessDate} is closed.` });
     }
 
-    const t = String(type).toUpperCase();
-    if (t !== "BUY" && t !== "SELL") {
-      return res.status(400).json({ error: "type must be BUY or SELL" });
-    }
-
-    const fa = Number(foreignAmount);
-    if (!Number.isFinite(fa) || fa <= 0) {
-      return res.status(400).json({ error: "foreignAmount must be a positive number" });
-    }
-
-    const cur = await pool.query(
-      "SELECT buy_rate, sell_rate FROM currencies WHERE code = $1 AND is_active = true",
-      [currencyCode]
-    );
-
-    if (cur.rowCount === 0) {
-      return res.status(404).json({ error: "Currency not found or inactive" });
-    }
-
-    const rate = t === "BUY" ? Number(cur.rows[0].buy_rate) : Number(cur.rows[0].sell_rate);
-    const mmkAmount = fa * rate;
-
-    const inserted = await pool.query(
-      `INSERT INTO transactions (business_date, type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by)
-       VALUES ($1::date,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id, business_date, date_time , type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by`,
-      [businessDate, t, currencyCode, fa, rate, mmkAmount, customerName || null, createdBy || null]
+    // Insert movement
+    const inserted = await client.query(
+      `INSERT INTO cash_movements
+        (business_date, date_time, tender_method, currency_code,
+         amount, direction, reason, reference_no, created_by)
+       VALUES ($1::date, $2::timestamptz, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        businessDate,
+        dt.toISOString(),
+        method,
+        method === "FX" ? currencyCode : null,
+        amt,
+        dir,
+        reason || null,
+        referenceNo || null,
+        req.user.username,
+      ]
     );
 
     res.status(201).json(inserted.rows[0]);
+
   } catch (err) {
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Create a transaction (BUY/SELL) and calculate MMK amount
+app.post("/api/transactions", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { type, currencyCode, foreignAmount, customerName, payments, transactionDateTime } = req.body;
+    const createdBy = req.user.username;
+
+    const raw = String(transactionDateTime || "").trim();
+    if (!raw) {
+      return res.status(400).json({
+        error: "transactionDateTime is required (must include timezone offset, e.g. 2026-03-02T10:30:00+06:30)",
+      });
+    }
+
+    const dt = new Date(raw);
+    if (Number.isNaN(dt.getTime())) {
+      return res.status(400).json({ error: "Invalid transactionDateTime" });
+    }
+
+    // ✅ business date = user’s local date part (NOT UTC)
+    const businessDate = raw.slice(0, 10);
+
+    // ✅ Block if day closed for that business date
+    const closed = await client.query(
+      `SELECT closed_at FROM daily_balances WHERE business_date = $1::date`,
+      [businessDate]
+    );
+    if (closed.rowCount && closed.rows[0].closed_at) {
+      return res.status(403).json({ error: `Day ${businessDate} is closed.` });
+    }
+
+    const t = String(type).toUpperCase();
+    const fa = Number(foreignAmount);
+
+    if (!["BUY", "SELL"].includes(t)) {
+      return res.status(400).json({ error: "type must be BUY or SELL" });
+    }
+    if (!Number.isFinite(fa) || fa <= 0) {
+      return res.status(400).json({ error: "Invalid foreignAmount" });
+    }
+
+    const cur = await client.query(
+      "SELECT buy_rate, sell_rate FROM currencies WHERE code = $1 AND is_active = true",
+      [String(currencyCode).toUpperCase()]
+    );
+
+    if (cur.rowCount === 0) {
+      return res.status(404).json({ error: "Currency not found" });
+    }
+
+    const rate = t === "BUY" ? Number(cur.rows[0].buy_rate) : Number(cur.rows[0].sell_rate);
+    const mmkAmount = Number((fa * rate).toFixed(2));
+
+    // ---- PAYMENT LOGIC (validated & normalized) ----
+    const allowedMethods = new Set(["CASH_MMK", "MOBILE_BANKING"]);
+    let paymentRows = Array.isArray(payments) ? payments : [];
+
+    // ---- default: all cash ------- //
+    if (paymentRows.length === 0) {
+      paymentRows = [{ method: "CASH_MMK", amountMMK: mmkAmount }];
+    }
+
+    const normalized = paymentRows.map((p) => {
+      const method = String(p.method || "").toUpperCase().trim();
+      if (!allowedMethods.has(method)) {
+        throw new Error(`Invalid payment method: ${method}`);
+      }
+
+      const amount = Number(p.amountMMK ?? p.amount_mmk ?? p.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error(`Invalid payment amount for ${method}`);
+      }
+
+      return {
+        method,
+        amount: Number(amount.toFixed(2)),
+        provider: p.provider ? String(p.provider) : null,
+        referenceNo: p.referenceNo
+          ? String(p.referenceNo)
+          : p.reference_no
+          ? String(p.reference_no)
+          : null,
+      };
+    });
+
+
+    const total = normalized.reduce((sum, p) => sum + p.amount, 0);
+    if (Math.abs(total - mmkAmount) > 0.01) {
+      return res.status(400).json({
+        error: `Payment amounts do not match transaction total: payments=${total}, total=${mmkAmount}`,
+      });
+    }
+
+    // ✅ Block BUY if not enough MMK in the selected payment method(s)
+    if (t === "BUY") {
+      for (const p of normalized) {
+        const { exists, available } = await getAvailableMMK(client, businessDate, p.method);
+
+        if (!exists) {
+          return res.status(400).json({
+            error: `No opening balance set for ${businessDate} (${p.method}).`,
+          });
+        }
+
+        if (available < p.amount) {
+          return res.status(400).json({
+            error: `Insufficient ${p.method}. Available: ${available}, required: ${p.amount}`,
+          });
+        }
+      }
+    }
+
+    // 🔒 Block SELL if not enough foreign currency
+    if (t === "SELL") {
+      const { exists, available } = await getAvailableFX(
+        client,
+        businessDate,
+        String(currencyCode).toUpperCase()
+      );
+
+      if (!exists) {
+        return res.status(400).json({
+          error: `No FX opening set for ${currencyCode} on ${businessDate}.`,
+        });
+      }
+
+      if (available < fa) {
+        return res.status(400).json({
+          error: `Insufficient ${currencyCode}. Available: ${available}, required: ${fa}`,
+        });
+      }
+    }
+
+    await client.query("BEGIN");
+
+    // ✅ Insert transaction using:
+    // - business_date from chosen datetime (or now)
+    // - date_time = chosen datetime (or now)
+    const inserted = await client.query(
+      `INSERT INTO transactions
+       (business_date, date_time, type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by)
+       VALUES ($1::date, $2::timestamptz, $3,$4,$5,$6,$7,$8,$9)
+       RETURNING id, business_date, date_time, type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by`,
+      [
+        businessDate,
+        raw,
+        t,
+        String(currencyCode).toUpperCase(),
+        fa,
+        rate,
+        mmkAmount,
+        customerName || null,
+        createdBy,
+      ]
+    );
+
+    const tx = inserted.rows[0];
+
+    // Insert payment rows
+    for (const p of normalized) {
+      await client.query(
+        `INSERT INTO transaction_payments
+         (transaction_id, method, amount_mmk, provider, reference_no)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [tx.id, p.method, p.amount, p.provider, p.referenceNo]
+      );
+    }
+
+    // Read back payments (source of truth)
+    const pay = await client.query(
+      `SELECT id, method, amount_mmk, provider, reference_no, created_at
+       FROM transaction_payments
+       WHERE transaction_id = $1
+       ORDER BY id`,
+      [tx.id]
+    );
+
+    await client.query("COMMIT");
+
+    res.status(201).json({ ...tx, payments: pay.rows });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -192,16 +674,30 @@ app.get("/api/transactions/:id", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id" });
 
-    const result = await pool.query(
+    // 1) get the transaction
+    const tx = await pool.query(
       `SELECT id, date_time, type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by
        FROM transactions
        WHERE id = $1`,
       [id]
     );
 
-    if (result.rowCount === 0) return res.status(404).json({ error: "Not found" });
+    if (tx.rowCount === 0) return res.status(404).json({ error: "Not found" });
 
-    res.json(result.rows[0]);
+    // 2) get payment rows for this transaction
+    const pay = await pool.query(
+      `SELECT id, method, amount_mmk, provider, reference_no, created_at
+       FROM transaction_payments
+       WHERE transaction_id = $1
+       ORDER BY id`,
+      [id]
+    );
+
+    // 3) return combined response
+    res.json({
+      ...tx.rows[0],
+      payments: pay.rows, // [] if none
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -307,21 +803,58 @@ app.get("/api/reports/daily", requireAuth, async (req, res) => {
     const { date } = req.query; // YYYY-MM-DD
     if (!date) return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
 
-    const result = await pool.query(
+    // 1) Business totals (unchanged meaning)
+    const txTotals = await pool.query(
       `
       SELECT
         $1::date AS date,
         COUNT(*)::int AS total_transactions,
-        COALESCE(SUM(CASE WHEN type='BUY'  THEN mmk_amount ELSE 0 END), 0) AS total_mmk_paid_out,   -- shop paid MMK
-        COALESCE(SUM(CASE WHEN type='SELL' THEN mmk_amount ELSE 0 END), 0) AS total_mmk_received   -- shop received MMK
+        COALESCE(SUM(CASE WHEN type='BUY'  THEN mmk_amount ELSE 0 END), 0) AS total_mmk_paid_out,
+        COALESCE(SUM(CASE WHEN type='SELL' THEN mmk_amount ELSE 0 END), 0) AS total_mmk_received
       FROM transactions
-      WHERE date_time >= $1::date
-        AND date_time < ($1::date + INTERVAL '1 day')
+      WHERE business_date = $1::date
       `,
       [date]
     );
 
-    res.json(result.rows[0]);
+    // 2) Tender totals (cash/mobile) from payments
+    const tenderTotals = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_in,
+        COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_out,
+        COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_in,
+        COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_out
+      FROM transaction_payments tp
+      JOIN transactions t ON t.id = tp.transaction_id
+      WHERE t.business_date = $1::date
+      `,
+      [date]
+    );
+
+    const t = txTotals.rows[0];
+    const p = tenderTotals.rows[0];
+
+    const cashIn = Number(p.cash_in);
+    const cashOut = Number(p.cash_out);
+    const mobileIn = Number(p.mobile_in);
+    const mobileOut = Number(p.mobile_out);
+
+    res.json({
+      date: t.date,
+      total_transactions: Number(t.total_transactions),
+      total_mmk_paid_out: Number(t.total_mmk_paid_out),
+      total_mmk_received: Number(t.total_mmk_received),
+
+      tenders: {
+        cashIn,
+        cashOut,
+        mobileIn,
+        mobileOut,
+        cashNet: Number((cashIn - cashOut).toFixed(2)),
+        mobileNet: Number((mobileIn - mobileOut).toFixed(2)),
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -403,15 +936,39 @@ app.get("/api/reports/monthly", requireAuth, async (req, res) => {
           AND opening_balance_mmk IS NOT NULL
           AND closing_balance_mmk IS NOT NULL
         GROUP BY 1
+      ),
+      tenders AS (
+        SELECT
+          date_trunc('month', t.business_date) AS m,
+          COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_in,
+          COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_out,
+          COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_in,
+          COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_out
+        FROM transaction_payments tp
+        JOIN transactions t ON t.id = tp.transaction_id
+        WHERE t.business_date >= ($1 || '-01-01')::date
+          AND t.business_date <  (($1 || '-01-01')::date + INTERVAL '1 year')
+        GROUP BY 1
       )
       SELECT
-        to_char(COALESCE(tx.m, pl.m), 'YYYY-MM') AS month,
+        to_char(COALESCE(tx.m, pl.m, tenders.m), 'YYYY-MM') AS month,
+
         COALESCE(tx.total_transactions, 0)::int AS total_transactions,
         COALESCE(tx.total_mmk_paid_out, 0) AS total_mmk_paid_out,
         COALESCE(tx.total_mmk_received, 0) AS total_mmk_received,
-        COALESCE(pl.profit_loss_mmk, 0) AS profit_loss_mmk
+        COALESCE(pl.profit_loss_mmk, 0) AS profit_loss_mmk,
+
+        COALESCE(tenders.cash_in, 0) AS cash_in,
+        COALESCE(tenders.cash_out, 0) AS cash_out,
+        COALESCE(tenders.mobile_in, 0) AS mobile_in,
+        COALESCE(tenders.mobile_out, 0) AS mobile_out,
+
+        (COALESCE(tenders.cash_in,0) - COALESCE(tenders.cash_out,0))::numeric AS cash_net,
+        (COALESCE(tenders.mobile_in,0) - COALESCE(tenders.mobile_out,0))::numeric AS mobile_net
+
       FROM tx
       FULL OUTER JOIN pl USING (m)
+      FULL OUTER JOIN tenders USING (m)
       ORDER BY month
       `,
       [String(year)]
@@ -447,15 +1004,36 @@ app.get("/api/reports/yearly", requireAuth, async (req, res) => {
           AND opening_balance_mmk IS NOT NULL
           AND closing_balance_mmk IS NOT NULL
         GROUP BY 1
+      ),
+      tenders AS (
+        SELECT
+          date_trunc('year', t.business_date) AS y,
+          COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_in,
+          COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_out,
+          COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_in,
+          COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_out
+        FROM transaction_payments tp
+        JOIN transactions t ON t.id = tp.transaction_id
+        GROUP BY 1
       )
       SELECT
-        to_char(COALESCE(tx.y, pl.y), 'YYYY') AS year,
+        to_char(COALESCE(tx.y, pl.y, tenders.y), 'YYYY') AS year,
         COALESCE(tx.total_transactions, 0)::int AS total_transactions,
         COALESCE(tx.total_mmk_paid_out, 0) AS total_mmk_paid_out,
         COALESCE(tx.total_mmk_received, 0) AS total_mmk_received,
-        COALESCE(pl.profit_loss_mmk, 0) AS profit_loss_mmk
+        COALESCE(pl.profit_loss_mmk, 0) AS profit_loss_mmk,
+
+        COALESCE(tenders.cash_in, 0)   AS cash_in,
+        COALESCE(tenders.cash_out, 0)  AS cash_out,
+        COALESCE(tenders.mobile_in, 0) AS mobile_in,
+        COALESCE(tenders.mobile_out, 0) AS mobile_out,
+
+        (COALESCE(tenders.cash_in, 0) - COALESCE(tenders.cash_out, 0)) AS cash_net,
+        (COALESCE(tenders.mobile_in, 0) - COALESCE(tenders.mobile_out, 0)) AS mobile_net
+
       FROM tx
       FULL OUTER JOIN pl USING (y)
+      FULL OUTER JOIN tenders USING (y)
       ORDER BY year
       `
     );
@@ -469,29 +1047,53 @@ app.get("/api/reports/yearly", requireAuth, async (req, res) => {
 // List transactions (optionally by date: YYYY-MM-DD)
 app.get("/api/transactions", requireAuth, async (req, res) => {
   try {
-    const { date } = req.query; // e.g. 2025-12-15
+    const { date } = req.query;
+
+    const baseQuery = `
+      SELECT
+        t.id,
+        t.date_time,
+        t.type,
+        t.currency_code,
+        t.foreign_amount,
+        t.rate,
+        t.mmk_amount,
+        t.customer_name,
+        t.created_by,
+
+        -- aggregated payment breakdown
+        COALESCE(SUM(CASE WHEN tp.method = 'CASH_MMK' THEN tp.amount_mmk ELSE 0 END), 0) AS cash_amount,
+        COALESCE(SUM(CASE WHEN tp.method = 'MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_amount
+
+      FROM transactions t
+      LEFT JOIN transaction_payments tp
+        ON tp.transaction_id = t.id
+    `;
 
     if (!date) {
-      // no filter, return latest 100
       const result = await pool.query(
-        `SELECT id, date_time, type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by
-         FROM transactions
-         ORDER BY date_time DESC
-         LIMIT 100`
+        `
+        ${baseQuery}
+        GROUP BY t.id
+        ORDER BY t.date_time DESC
+        LIMIT 100
+        `
       );
       return res.json(result.rows);
     }
 
-    // filter by the whole day (00:00 to 23:59) in DB time
     const result = await pool.query(
-      `SELECT id, date_time, type, currency_code, foreign_amount, rate, mmk_amount, customer_name, created_by
-       FROM transactions
-       WHERE business_date=$1::date
-       ORDER BY date_time DESC`,
+      `
+      ${baseQuery}
+      WHERE t.business_date = $1::date
+      GROUP BY t.id
+      ORDER BY t.date_time DESC
+      `,
       [date]
     );
 
     res.json(result.rows);
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -501,24 +1103,39 @@ app.get("/api/transactions", requireAuth, async (req, res) => {
 // Set opening balance for a date (creates/overwrites opening)
 app.post("/api/balances/open", requireAuth, async (req, res) => {
   try {
-    const { date, openingBalanceMMK } = req.body; // date: 'YYYY-MM-DD'
+    const { date, openingBalanceMMK, openingMobileMMK } = req.body; // NEW: openingMobileMMK
+
     if (!date) return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
 
-    const opening = Number(openingBalanceMMK);
-    if (!Number.isFinite(opening) || opening < 0) {
+    const openingCash = Number(openingBalanceMMK);
+    if (!Number.isFinite(openingCash) || openingCash < 0) {
       return res.status(400).json({ error: "openingBalanceMMK must be a number >= 0" });
     }
 
-    // Upsert: if exists, update opening; if not, insert
+    // mobile is optional (you can force required if you want)
+    const openingMobile =
+      openingMobileMMK === undefined || openingMobileMMK === null || openingMobileMMK === ""
+        ? null
+        : Number(openingMobileMMK);
+
+    if (openingMobile !== null && (!Number.isFinite(openingMobile) || openingMobile < 0)) {
+      return res.status(400).json({ error: "openingMobileMMK must be a number >= 0" });
+    }
+
     const result = await pool.query(
       `
-      INSERT INTO daily_balances (business_date, opening_balance_mmk)
-      VALUES ($1::date, $2)
+      INSERT INTO daily_balances (business_date, opening_balance_mmk, opening_mobile_mmk)
+      VALUES ($1::date, $2, $3)
       ON CONFLICT (business_date)
-      DO UPDATE SET opening_balance_mmk = EXCLUDED.opening_balance_mmk
-      RETURNING business_date, opening_balance_mmk, closing_balance_mmk, opened_at, closed_at
+      DO UPDATE SET
+        opening_balance_mmk = EXCLUDED.opening_balance_mmk,
+        opening_mobile_mmk  = COALESCE(EXCLUDED.opening_mobile_mmk, daily_balances.opening_mobile_mmk)
+      RETURNING business_date,
+                opening_balance_mmk, opening_mobile_mmk,
+                closing_balance_mmk, closing_mobile_mmk,
+                opened_at, closed_at
       `,
-      [date, opening]
+      [date, openingCash, openingMobile]
     );
 
     res.json(result.rows[0]);
@@ -778,14 +1395,15 @@ app.delete("/api/balances/fx", requireAuth, requireRole("admin"), async (req, re
 app.get("/api/balances", async (req, res) => {
   try {
     const { date } = req.query;
-    if (!date) {
-      return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
-    }
+    if (!date) return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
 
-    // 1️⃣ Daily MMK balance
+    // 1️⃣ Daily balances (now includes mobile columns)
     const balResult = await pool.query(
       `
-      SELECT id, business_date, opening_balance_mmk, closing_balance_mmk, opened_at, closed_at
+      SELECT id, business_date,
+             opening_balance_mmk, closing_balance_mmk,
+             opening_mobile_mmk,  closing_mobile_mmk,
+             opened_at, closed_at
       FROM daily_balances
       WHERE business_date = $1::date
       `,
@@ -794,19 +1412,54 @@ app.get("/api/balances", async (req, res) => {
 
     const balance = balResult.rowCount ? balResult.rows[0] : null;
 
-    // 2️⃣ Transaction totals (DO NOT TOUCH)
-    const totalsResult = await pool.query(
+    const openingCash = balance?.opening_balance_mmk ?? null;
+    const openingMobile = balance?.opening_mobile_mmk ?? null;
+
+    // 2️⃣ Tender totals from transaction_payments (cash vs mobile)
+    // Assumption consistent with your code comments:
+    // SELL = shop receives MMK (IN), BUY = shop pays out MMK (OUT)
+    const tenderTotals = await pool.query(
       `
       SELECT
-        COALESCE(SUM(CASE WHEN type='BUY'  THEN mmk_amount ELSE 0 END), 0) AS paid_out,
-        COALESCE(SUM(CASE WHEN type='SELL' THEN mmk_amount ELSE 0 END), 0) AS received
+        COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_in,
+        COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='CASH_MMK'       THEN tp.amount_mmk ELSE 0 END), 0) AS cash_out,
+        COALESCE(SUM(CASE WHEN t.type='SELL' AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_in,
+        COALESCE(SUM(CASE WHEN t.type='BUY'  AND tp.method='MOBILE_BANKING' THEN tp.amount_mmk ELSE 0 END), 0) AS mobile_out
+      FROM transaction_payments tp
+      JOIN transactions t ON t.id = tp.transaction_id
+      WHERE t.business_date = $1::date
+      `,
+      [date]
+    );
+
+    const cashIn = Number(tenderTotals.rows[0].cash_in);
+    const cashOut = Number(tenderTotals.rows[0].cash_out);
+    const mobileIn = Number(tenderTotals.rows[0].mobile_in);
+    const mobileOut = Number(tenderTotals.rows[0].mobile_out);
+
+    const suggestedClosingCash =
+      openingCash === null || openingCash === undefined
+        ? null
+        : Number((Number(openingCash) + cashIn - cashOut).toFixed(2));
+
+    const suggestedClosingMobile =
+      openingMobile === null || openingMobile === undefined
+        ? null
+        : Number((Number(openingMobile) + mobileIn - mobileOut).toFixed(2));
+
+    // 2.5️⃣ Keep your old transaction totals (business volume) if you still want them
+    const txTotals = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN type='BUY'  THEN mmk_amount ELSE 0 END), 0) AS total_mmk_paid_out,
+        COALESCE(SUM(CASE WHEN type='SELL' THEN mmk_amount ELSE 0 END), 0) AS total_mmk_received
       FROM transactions
       WHERE business_date = $1::date
       `,
       [date]
     );
 
-    // FX totals from transactions (per currency)
+    // FX totals from transactions (per currency) - unchanged
     const fxTx = await pool.query(
       `
       SELECT
@@ -821,28 +1474,12 @@ app.get("/api/balances", async (req, res) => {
       [date]
     );
 
-    const paidOut = Number(totalsResult.rows[0].paid_out);
-    const received = Number(totalsResult.rows[0].received);
-
-    const openingBalanceMMK = balance
-      ? Number(balance.opening_balance_mmk)
-      : null;
-
-    const suggestedClosingMMK =
-      openingBalanceMMK === null
-        ? null
-        : Number((openingBalanceMMK + received - paidOut).toFixed(2));
-
-    // 3️⃣ FX balances (SAFE ADDITION)
+    // 3️⃣ FX balances (unchanged, just uses daily_balance_fx)
     let fxBalances = [];
-
     if (balance) {
       const fxResult = await pool.query(
         `
-        SELECT
-          currency_code,
-          opening_amount,
-          closing_amount
+        SELECT currency_code, opening_amount, closing_amount
         FROM daily_balance_fx
         WHERE daily_balance_id = $1
         ORDER BY currency_code
@@ -853,13 +1490,11 @@ app.get("/api/balances", async (req, res) => {
       fxBalances = fxResult.rows.map(row => ({
         currency: row.currency_code,
         openingAmount: row.opening_amount === null ? null : Number(row.opening_amount),
-        closingAmount: row.closing_amount !== null
-          ? Number(row.closing_amount)
-          : null,
+        closingAmount: row.closing_amount !== null ? Number(row.closing_amount) : null,
       }));
     }
 
-    // 3.5️⃣ Merge FX transaction totals into fxBalances (+ suggested closing & difference)
+    // 3.5️⃣ Merge FX transaction totals into fxBalances (+ suggested closing & difference) - unchanged
     const fxTotalsByCur = {};
     for (const r of fxTx.rows) {
       const cur = r.currency_code;
@@ -892,21 +1527,34 @@ app.get("/api/balances", async (req, res) => {
       };
     });
 
-    // 4️⃣ Final response
     res.json({
       date,
-      openingBalanceMMK,
-      closingBalanceMMK: balance ? balance.closing_balance_mmk : null,
+
+      // openings/closings (cash + mobile)
+      openingBalanceMMK: openingCash === null ? null : Number(openingCash),
+      closingBalanceMMK: balance?.closing_balance_mmk ?? null,
+      openingMobileMMK: openingMobile === null ? null : Number(openingMobile),
+      closingMobileMMK: balance?.closing_mobile_mmk ?? null,
+
       isClosed: balance ? !!balance.closed_at : false,
 
-      totals: {
-        totalMMKReceived: received,
-        totalMMKPaidOut: paidOut,
+      // tender totals (what you need now)
+      tenders: {
+        cashIn,
+        cashOut,
+        mobileIn,
+        mobileOut,
       },
 
-      suggestedClosingMMK,
+      suggestedClosingMMK: suggestedClosingCash,
+      suggestedClosingMobileMMK: suggestedClosingMobile,
 
-      // ✅ FX INCLUDED
+      // keep business totals too (optional)
+      totals: {
+        totalMMKReceived: Number(txTotals.rows[0].total_mmk_received),
+        totalMMKPaidOut: Number(txTotals.rows[0].total_mmk_paid_out),
+      },
+
       fxBalances,
     });
   } catch (err) {
@@ -918,12 +1566,21 @@ app.get("/api/balances", async (req, res) => {
 // Close the day (store closing balance)
 app.post("/api/balances/close", requireAuth, async (req, res) => {
   try {
-    const { date, closingBalanceMMK } = req.body; // date: 'YYYY-MM-DD'
+    const { date, closingBalanceMMK, closingMobileMMK } = req.body; // NEW: closingMobileMMK
     if (!date) return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
 
-    const closing = Number(closingBalanceMMK);
-    if (!Number.isFinite(closing)) {
-    return res.status(400).json({ error: "closingBalanceMMK must be a number" });
+    const closingCash = Number(closingBalanceMMK);
+    if (!Number.isFinite(closingCash)) {
+      return res.status(400).json({ error: "closingBalanceMMK must be a number" });
+    }
+
+    const closingMobile =
+      closingMobileMMK === undefined || closingMobileMMK === null || closingMobileMMK === ""
+        ? null
+        : Number(closingMobileMMK);
+
+    if (closingMobile !== null && !Number.isFinite(closingMobile)) {
+      return res.status(400).json({ error: "closingMobileMMK must be a number" });
     }
 
     // Must already have opening set
@@ -935,16 +1592,24 @@ app.post("/api/balances/close", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Set opening balance first for this date." });
     }
 
-    // Mark closed
+    // Optional: block if already closed
+    if (existing.rows[0].closed_at) {
+      return res.status(403).json({ error: "Day is already closed. Re-open to change closing." });
+    }
+
     const result = await pool.query(
       `
       UPDATE daily_balances
       SET closing_balance_mmk = $2,
+          closing_mobile_mmk  = $3,
           closed_at = NOW()
       WHERE business_date = $1::date
-      RETURNING business_date, opening_balance_mmk, closing_balance_mmk, opened_at, closed_at
+      RETURNING business_date,
+                opening_balance_mmk, opening_mobile_mmk,
+                closing_balance_mmk, closing_mobile_mmk,
+                opened_at, closed_at
       `,
-      [date, closing]
+      [date, closingCash, closingMobile]
     );
 
     res.json(result.rows[0]);

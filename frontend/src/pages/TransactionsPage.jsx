@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
+import useT from "../useT";
 
 function todayISO() {
   const d = new Date();
@@ -9,13 +10,51 @@ function todayISO() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function formatNumber(n) {
+  const num = Number(n);
+  if (n === null || n === undefined || n === "") return "—";
+  if (!Number.isFinite(num)) return String(n ?? "—");
+  return num.toLocaleString("en-US");
+}
+
+function PaymentCell({ cash, mobile }) {
+  const c = Number(cash ?? 0);
+  const m = Number(mobile ?? 0);
+
+  const hasCash = Number.isFinite(c) && c > 0;
+  const hasMobile = Number.isFinite(m) && m > 0;
+
+  if (!hasCash && !hasMobile) return <span className="tx-muted">—</span>;
+
+  return (
+    <div className="tx-pay">
+      {hasCash ? (
+        <div className="tx-pay__row">
+          <span className="tx-pay__tag">CASH: </span>
+          <span className="mono">{formatNumber(c)}</span>
+        </div>
+      ) : null}
+
+      {hasMobile ? (
+        <div className="tx-pay__row">
+          <span className="tx-pay__tag tx-pay__tag--mobile">MOBILE: </span>
+          <span className="mono">{formatNumber(m)}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export default function TransactionsPage() {
+  const { t,lang } = useT();
   const [date, setDate] = useState(todayISO());
   const [rows, setRows] = useState([]);
-  const [summary, setSummary] = useState(null);
+  const [summary, setSummary] = useState(null); // /api/reports/daily
+  const [balance, setBalance] = useState(null); // /api/balances
   const [error, setError] = useState("");
   const [me, setMe] = useState(null);
-  const [currencies, setCurrencies]=useState([]);
+  const [currencies, setCurrencies] = useState([]);
+  const [loading, setLoading] = useState(false);
 
   const [editingId, setEditingId] = useState(null);
   const [edit, setEdit] = useState({
@@ -28,10 +67,12 @@ export default function TransactionsPage() {
 
   async function load() {
     setError("");
+    setLoading(true);
     try {
-      const [txRes, sumRes] = await Promise.all([
+      const [txRes, sumRes, balRes] = await Promise.all([
         axios.get(`/api/transactions?date=${encodeURIComponent(date)}`),
         axios.get(`/api/reports/daily?date=${encodeURIComponent(date)}`),
+        axios.get(`/api/balances?date=${encodeURIComponent(date)}`),
       ]);
 
       if (!Array.isArray(txRes.data)) {
@@ -39,10 +80,15 @@ export default function TransactionsPage() {
       }
 
       setRows(txRes.data);
-      setSummary(sumRes.data);
+      setSummary(sumRes.data || null);
+      setBalance(balRes.data || null);
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
-      setRows([]); // prevent stale UI
+      setRows([]);
+      setSummary(null);
+      setBalance(null);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -59,7 +105,13 @@ export default function TransactionsPage() {
 
   function cancelEdit() {
     setEditingId(null);
-    setEdit({ type: "SELL", currency_code: "USD", foreign_amount: "", rate: "", customer_name: "" });
+    setEdit({
+      type: "SELL",
+      currency_code: "USD",
+      foreign_amount: "",
+      rate: "",
+      customer_name: "",
+    });
   }
 
   async function saveEdit(id) {
@@ -105,10 +157,10 @@ export default function TransactionsPage() {
   useEffect(() => {
     axios.get("/api/auth/me").then((res) => setMe(res.data)).catch(() => setMe(null));
 
-    axios.get("/api/currencies")
-    .then((res)=>setCurrencies(Array.isArray(res.data)? res.data:[]))
-    .catch(()=>setCurrencies([]));
-
+    axios
+      .get("/api/currencies")
+      .then((res) => setCurrencies(Array.isArray(res.data) ? res.data : []))
+      .catch(() => setCurrencies([]));
   }, []);
 
   useEffect(() => {
@@ -118,11 +170,9 @@ export default function TransactionsPage() {
     if (!cur) return;
 
     const newRate = edit.type === "BUY" ? cur.buy_rate : cur.sell_rate;
-
-    // only auto-set if rate is empty OR matches the old default style
     setEdit((p) => ({ ...p, rate: String(newRate) }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [edit.currency_code, edit.type, editingId, currencies]);
+  }, [edit.currency_code, edit.type, editingId, currencies]);
 
   useEffect(() => {
     load();
@@ -139,182 +189,341 @@ export default function TransactionsPage() {
     return { paidOut, received };
   }, [rows]);
 
+  // tender totals (IN/OUT/NET) based on type BUY/SELL (fallback if summary missing)
+  const tenderTotals = useMemo(() => {
+    let cashIn = 0;
+    let cashOut = 0;
+    let mobileIn = 0;
+    let mobileOut = 0;
+
+    for (const r of rows) {
+      const c = Number(r.cash_amount ?? 0);
+      const m = Number(r.mobile_amount ?? 0);
+
+      if (r.type === "SELL") {
+        cashIn += c;
+        mobileIn += m;
+      } else if (r.type === "BUY") {
+        cashOut += c;
+        mobileOut += m;
+      }
+    }
+
+    const cashNet = Number((cashIn - cashOut).toFixed(2));
+    const mobileNet = Number((mobileIn - mobileOut).toFixed(2));
+
+    return { cashIn, cashOut, cashNet, mobileIn, mobileOut, mobileNet };
+  }, [rows]);
+
+  const totalTx = summary?.total_transactions ?? rows.length;
+  const mmkPaidOut = summary?.total_mmk_paid_out ?? totals.paidOut;
+  const mmkReceived = summary?.total_mmk_received ?? totals.received;
+
+  // ✅ prefer backend-calculated tender totals
+  const cashIn = summary?.tenders?.cashIn ?? tenderTotals.cashIn;
+  const cashOut = summary?.tenders?.cashOut ?? tenderTotals.cashOut;
+  const mobileIn = summary?.tenders?.mobileIn ?? tenderTotals.mobileIn;
+  const mobileOut = summary?.tenders?.mobileOut ?? tenderTotals.mobileOut;
+
+  // ✅ “cash left / mobile left” = opening + in - out
+  const openingCash = balance?.openingBalanceMMK ?? null;
+  const openingMobile = balance?.openingMobileMMK ?? null;
+
+  const cashLeft =
+    balance?.suggestedClosingMMK ??
+    (openingCash === null || openingCash === undefined
+      ? null
+      : Number((Number(openingCash) + Number(cashIn) - Number(cashOut)).toFixed(2)));
+
+  const mobileLeft =
+    balance?.suggestedClosingMobileMMK ??
+    (openingMobile === null || openingMobile === undefined
+      ? null
+      : Number((Number(openingMobile) + Number(mobileIn) - Number(mobileOut)).toFixed(2)));
+
   return (
-    <div style={{ maxWidth: 1100 }}>
-      <h3 style={{ marginTop: 0 }}>Transactions</h3>
+    <div className="tx-page">
+      {/* PAGE HEADER */}
+      <div className="tx-pagehead">
+        <div className="tx-pagehead__left">
+          <h1 className="tx-title">{t("transactions")}</h1>
+          <p className="tx-subtitle">Daily transaction log • Inline edit (admin) • Audit-friendly records</p>
+        </div>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
-        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          Date:
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-        </label>
+        <div className="tx-pagehead__right">
+          <div className="tx-controls">
+            <label className="tx-date">
+              <span>Date</span>
+              <input
+                className="tx-input"
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+              />
+            </label>
 
-        <button onClick={load} style={{ padding: "8px 10px", cursor: "pointer" }}>
-          Refresh
-        </button>
+            <button
+              onClick={load}
+              className="tx-btn tx-btn--ghost"
+              type="button"
+              disabled={loading}
+              title="Refresh"
+            >
+              {loading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="tx-hintline">Tip: switch type/currency to auto-pull default rate.</div>
+        </div>
       </div>
 
-      {error ? <div style={{ color: "crimson", marginBottom: 8 }}>{error}</div> : null}
+      {/* ERROR */}
+      {error ? (
+        <div className="tx-alert tx-alert--danger">
+          <div className="tx-alert__title">Couldn’t load transactions</div>
+          <div className="tx-alert__body">{error}</div>
+        </div>
+      ) : null}
 
-      <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-        <div style={card}>
-          <div style={label}>Total transactions</div>
-          <div style={value}>{summary?.total_transactions ?? rows.length}</div>
+      {/* KPI ROW */}
+      <div className="tx-kpis">
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{t("totaltransactions")}</div>
+          <div className="tx-kpi__value">{formatNumber(totalTx)}</div>
         </div>
-        <div style={card}>
-          <div style={label}>MMK Paid Out (BUY)</div>
-          <div style={value}>{(summary?.total_mmk_paid_out ?? totals.paidOut).toString()}</div>
+        
+
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{t("mmkpaidout")}</div>
+          <div className="tx-kpi__value tx-kpi__value--buy">{formatNumber(mmkPaidOut)}</div>
         </div>
-        <div style={card}>
-          <div style={label}>MMK Received (SELL)</div>
-          <div style={value}>{(summary?.total_mmk_received ?? totals.received).toString()}</div>
+
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{t("mmkreceived")}</div>
+          <div className="tx-kpi__value tx-kpi__value--sell">{formatNumber(mmkReceived)}</div>
+        </div>       
+
+        {/* ✅ NEW: Mobile OUT */}
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{lang === "mm" ? "Mobile ထွက်ငွေ" : "Mobile OUT"}</div>
+          <div className="tx-kpi__value tx-kpi__value--buy">{formatNumber(mobileOut)}</div>
+        </div>
+
+         {/* ✅ NEW: Mobile IN */}
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{lang === "mm" ? "Mobile ၀င်ငွေ" : "Mobile IN"}</div>
+          <div className="tx-kpi__value tx-kpi__value--sell">{formatNumber(mobileIn)}</div>
+        </div>
+
+        {/* ✅ Cash Left */}
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{t("cashLeft")}</div>
+          <div className="tx-kpi__value">{formatNumber(cashLeft)}</div>
+          <div className="tx-muted" style={{ marginTop: 6, fontSize: 12 }}>
+            {lang === "mm" ? "ဖွင့်ငွေ" : "Open"} : <span className="mono">{formatNumber(openingCash)}</span>
+            {" + "}{lang === "mm" ? "၀င်ငွေ" : "IN"}: <span className="mono">{formatNumber(cashIn)}</span>
+            {" - "}{lang === "mm" ? "ထွက်ငွေ" : "OUT"}: <span className="mono">{formatNumber(cashOut)}</span>
+          </div>
+        </div>
+
+        {/* ✅ Mobile Left */}
+        <div className="tx-kpi mc-card">
+          <div className="tx-kpi__label">{t("mobileLeft")}</div>
+          <div className="tx-kpi__value">{formatNumber(mobileLeft)}</div>
+          <div className="tx-muted" style={{ marginTop: 6, fontSize: 12 }}>
+            {lang === "mm" ? "ဖွင်ငွေ" : "Open"}: <span className="mono">{formatNumber(openingMobile)}</span>
+            {" + "}{lang === "mm" ? "၀င်ငွေ" : "IN"}: <span className="mono">{formatNumber(mobileIn)}</span>
+            {" - "}{lang === "mm" ? "ထွက်ငွေ" : "OUT"}: <span className="mono">{formatNumber(mobileOut)}</span>
+          </div>
         </div>
       </div>
 
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr>
-              <th style={th}>Time</th>
-              <th style={th}>Type</th>
-              <th style={th}>Currency</th>
-              <th style={th}>Foreign</th>
-              <th style={th}>Rate</th>
-              <th style={th}>MMK</th>
-              <th style={th}>Customer</th>
-              <th style={th}>Cashier</th>
-              <th style={th}>Edit</th>
-              <th style={th}>Delete</th>
-            </tr>
-          </thead>
+      {/* TABLE CARD */}
+      <div className="mc-card tx-table-card">
+        <div className="tx-table-head">
+          <div>
+            <div className="tx-table-title">
+              {date ? new Date(date + "T00:00:00").toLocaleDateString("en-GB") : ""} {t("dailyLog")}
+            </div>
+            <div className="tx-table-meta">{loading ? "Loading…" : `${rows.length} row(s)`}</div>
+          </div>
+        </div>
 
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.id}>
-                <td style={td}>{new Date(r.date_time).toLocaleTimeString()}</td>
-
-                <td style={td}>
-                  {editingId === r.id ? (
-                    <select
-                      value={edit.type}
-                      onChange={(e) => setEdit((p) => ({ ...p, type: e.target.value }))}
-                    >
-                      <option value="BUY">BUY</option>
-                      <option value="SELL">SELL</option>
-                    </select>
-                  ) : (
-                    <b>{r.type}</b>
-                  )}
-                </td>
-
-                <td style={td}>
-                 {editingId === r.id ? (
-                    <select
-                        value={edit.currency_code}
-                        onChange={(e) => setEdit((p) => ({ ...p, currency_code: e.target.value }))}
-                        style={{ padding: 6 }}
-                    >
-                        {currencies.map((c) => (
-                        <option key={c.code} value={c.code}>
-                            {c.code}
-                        </option>
-                        ))}
-                    </select>
-                    ) : (
-                    r.currency_code
-                    )}
-                </td>
-
-                <td style={td}>
-                  {editingId === r.id ? (
-                    <input
-                      type="number"
-                      value={edit.foreign_amount}
-                      onChange={(e) => setEdit((p) => ({ ...p, foreign_amount: e.target.value }))}
-                      style={{ width: 110, padding: 6 }}
-                    />
-                  ) : (
-                    r.foreign_amount
-                  )}
-                </td>
-
-                <td style={td}>
-                  {editingId === r.id ? (
-                    <input
-                      type="number"
-                      value={edit.rate}
-                      onChange={(e) => setEdit((p) => ({ ...p, rate: e.target.value }))}
-                      style={{ width: 120, padding: 6 }}
-                    />
-                  ) : (
-                    r.rate
-                  )}
-                </td>
-
-                <td style={td}><b>{r.mmk_amount}</b></td>
-
-                <td style={td}>
-                  {editingId === r.id ? (
-                    <input
-                      value={edit.customer_name}
-                      onChange={(e) => setEdit((p) => ({ ...p, customer_name: e.target.value }))}
-                      style={{ width: 160, padding: 6 }}
-                    />
-                  ) : (
-                    r.customer_name || "-"
-                  )}
-                </td>
-
-                <td style={td}>{r.created_by || "-"}</td>
-
-                <td style={td}>
-                  {me?.role === "admin" ? (
-                    editingId === r.id ? (
-                      <div style={{ display: "flex", gap: 8 }}>
-                        <button onClick={() => saveEdit(r.id)} style={{ padding: "6px 10px" }}>
-                          Save
-                        </button>
-                        <button onClick={cancelEdit} style={{ padding: "6px 10px" }}>
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <button onClick={() => startEdit(r)} style={{ padding: "6px 10px" }}>
-                        Edit
-                      </button>
-                    )
-                  ) : (
-                    "-"
-                  )}
-                </td>
-
-                <td style={td}>
-                  {me?.role === "admin" ? (
-                    <button onClick={() => deleteTx(r.id)} style={{ padding: "6px 10px" }}>
-                      Delete
-                    </button>
-                  ) : (
-                    "-"
-                  )}
-                </td>
-              </tr>
-            ))}
-
-            {rows.length === 0 ? (
+        <div className="tx-table-wrap">
+          <table className="tx-table">
+            <thead>
               <tr>
-                <td style={td} colSpan={10}>No transactions for this date.</td>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Currency</th>
+                <th>Foreign Amt</th>
+                <th>Rate</th>
+                <th>Total MMK</th>
+                <th>Payment</th>
+                <th>Customer</th>
+                <th>Cashier</th>
+                <th>Actions</th>
               </tr>
-            ) : null}
-          </tbody>
-        </table>
+            </thead>
+
+            <tbody>
+              {loading ? (
+                <>
+                  <SkeletonRow />
+                  <SkeletonRow />
+                  <SkeletonRow />
+                </>
+              ) : rows.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="tx-empty">
+                    <div className="tx-empty__icon">🧾</div>
+                    <div className="tx-empty__title">No transactions for this date</div>
+                    <div className="tx-empty__sub">Try selecting another date or create a new transaction.</div>
+                  </td>
+                </tr>
+              ) : (
+                rows.map((r) => {
+                  const isEditing = editingId === r.id;
+                  const canAdmin = me?.role === "admin";
+
+                  return (
+                    <tr key={r.id}>
+                      <td className="mono">
+                        {new Date(r.date_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                      </td>
+
+                      <td className="tx-center">
+                        {isEditing ? (
+                          <select
+                            className="tx-select"
+                            value={edit.type}
+                            onChange={(e) => setEdit((p) => ({ ...p, type: e.target.value }))}
+                          >
+                            <option value="BUY">BUY</option>
+                            <option value="SELL">SELL</option>
+                          </select>
+                        ) : (
+                          <span className={"tx-badge " + (r.type === "BUY" ? "tx-badge--buy" : "tx-badge--sell")}>
+                            {r.type}
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="tx-center">
+                        {isEditing ? (
+                          <select
+                            className="tx-select"
+                            value={edit.currency_code}
+                            onChange={(e) => setEdit((p) => ({ ...p, currency_code: e.target.value }))}
+                          >
+                            {currencies.map((c) => (
+                              <option key={c.code} value={c.code}>
+                                {c.code}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="tx-currency">{r.currency_code}</span>
+                        )}
+                      </td>
+
+                      <td className="mono">
+                        {isEditing ? (
+                          <input
+                            className="tx-input tx-input--sm mono"
+                            type="number"
+                            value={edit.foreign_amount}
+                            onChange={(e) => setEdit((p) => ({ ...p, foreign_amount: e.target.value }))}
+                          />
+                        ) : (
+                          formatNumber(r.foreign_amount)
+                        )}
+                      </td>
+
+                      <td className="mono">
+                        {isEditing ? (
+                          <input
+                            className="tx-input tx-input--sm mono"
+                            type="number"
+                            value={edit.rate}
+                            onChange={(e) => setEdit((p) => ({ ...p, rate: e.target.value }))}
+                          />
+                        ) : (
+                          formatNumber(r.rate)
+                        )}
+                      </td>
+
+                      <td className="mono tx-mmk">{formatNumber(r.mmk_amount)}</td>
+
+                      <td>
+                        <PaymentCell cash={r.cash_amount} mobile={r.mobile_amount} />
+                      </td>
+
+                      <td>
+                        {isEditing ? (
+                          <input
+                            className="tx-input tx-input--sm"
+                            value={edit.customer_name}
+                            onChange={(e) => setEdit((p) => ({ ...p, customer_name: e.target.value }))}
+                            placeholder="Customer name"
+                          />
+                        ) : (
+                          r.customer_name || <span className="tx-muted">—</span>
+                        )}
+                      </td>
+
+                      <td>{r.created_by || <span className="tx-muted">—</span>}</td>
+
+                      <td>
+                        {canAdmin ? (
+                          isEditing ? (
+                            <div className="tx-actions">
+                              <button onClick={() => saveEdit(r.id)} className="tx-btn tx-btn--primary" type="button">
+                                Save
+                              </button>
+                              <button onClick={cancelEdit} className="tx-btn tx-btn--ghost" type="button">
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="tx-actions">
+                              <button onClick={() => startEdit(r)} className="tx-btn tx-btn--ghost" type="button">
+                                Edit
+                              </button>
+                              <button onClick={() => deleteTx(r.id)} className="tx-btn tx-btn--danger" type="button">
+                                Delete
+                              </button>
+                            </div>
+                          )
+                        ) : (
+                          <span className="tx-muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
 }
 
-const card = { border: "1px solid #ddd", borderRadius: 10, padding: 12, minWidth: 220 };
-const label = { fontSize: 12, opacity: 0.7 };
-const value = { fontSize: 18, fontWeight: 700 };
-
-const th = { textAlign: "left", borderBottom: "1px solid #ddd", padding: 10, whiteSpace: "nowrap" };
-const td = { borderBottom: "1px solid #eee", padding: 10, whiteSpace: "nowrap" };
+function SkeletonRow() {
+  return (
+    <tr className="tx-skel">
+      <td><div className="skel skel-sm" /></td>
+      <td><div className="skel skel-md" /></td>
+      <td><div className="skel skel-sm" /></td>
+      <td><div className="skel skel-sm" /></td>
+      <td><div className="skel skel-sm" /></td>
+      <td><div className="skel skel-md" /></td>
+      <td><div className="skel skel-lg" /></td>
+      <td><div className="skel skel-md" /></td>
+      <td><div className="skel skel-sm" /></td>
+      <td><div className="skel skel-lg" /></td>
+    </tr>
+  );
+}
