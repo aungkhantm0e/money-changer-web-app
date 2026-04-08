@@ -1,21 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import useT from "../useT";
+import { formatNumber, todayISO } from "../utils/formatters";
+import { useApi } from "../hooks/useApi";
+import { useForm } from "../hooks/useForm";
 
-function todayISO() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function formatNumber(n) {
-  const num = Number(n);
-  if (n === null || n === undefined || n === "") return "—";
-  if (!Number.isFinite(num)) return String(n ?? "—");
-  return num.toLocaleString("en-US");
-}
 
 function PaymentCell({ cash, mobile }) {
   const c = Number(cash ?? 0);
@@ -48,53 +37,55 @@ function PaymentCell({ cash, mobile }) {
 export default function TransactionsPage() {
   const { t,lang } = useT();
   const [date, setDate] = useState(todayISO());
-  const [rows, setRows] = useState([]);
-  const [summary, setSummary] = useState(null); // /api/reports/daily
-  const [balance, setBalance] = useState(null); // /api/balances
-  const [error, setError] = useState("");
+  const [currencySearchInput,setCurrencySearchInput]=useState("");
+  const [currencyFilter,setCurrencyFilter]=useState("");
   const [me, setMe] = useState(null);
   const [currencies, setCurrencies] = useState([]);
-  const [loading, setLoading] = useState(false);
 
-  const [editingId, setEditingId] = useState(null);
-  const [edit, setEdit] = useState({
+  // useApi for data fetching - refetches when date changes
+  const { data: apiData, loading, error, execute: refresh } = useApi(
+    () => {
+      const txParams=new URLSearchParams({date});
+      if(currencyFilter) txParams.set("currency",currencyFilter);
+      
+       return Promise.all([
+        axios.get(`/api/transactions?${txParams.toString()}`),
+        axios.get(`/api/reports/daily?date=${encodeURIComponent(date)}`),
+        axios.get(`/api/balances?date=${encodeURIComponent(date)}`),
+      ]).then(([txRes, sumRes, balRes]) => ({
+        rows: txRes.data,
+        summary: sumRes.data,
+        balance: balRes.data,
+      }));
+    },
+    { immediate: true, deps: [date, currencyFilter] }
+  );
+
+  const rows = apiData?.rows || [];
+  const summary = apiData?.summary || null;
+  const balance = apiData?.balance || null;
+
+  // useForm for edit
+  const { values: edit, setField, reset: resetEdit } = useForm({
     type: "SELL",
     currency_code: "USD",
     foreign_amount: "",
     rate: "",
     customer_name: "",
   });
+  const [editingId, setEditingId] = useState(null);
 
-  async function load() {
-    setError("");
-    setLoading(true);
-    try {
-      const [txRes, sumRes, balRes] = await Promise.all([
-        axios.get(`/api/transactions?date=${encodeURIComponent(date)}`),
-        axios.get(`/api/reports/daily?date=${encodeURIComponent(date)}`),
-        axios.get(`/api/balances?date=${encodeURIComponent(date)}`),
-      ]);
-
-      if (!Array.isArray(txRes.data)) {
-        throw new Error("Transactions API did not return an array. Check backend error.");
-      }
-
-      setRows(txRes.data);
-      setSummary(sumRes.data || null);
-      setBalance(balRes.data || null);
-    } catch (e) {
-      setError(e?.response?.data?.error || e.message);
-      setRows([]);
-      setSummary(null);
-      setBalance(null);
-    } finally {
-      setLoading(false);
-    }
+  function applyCurrencySearch() {
+    setCurrencyFilter(currencySearchInput.trim().toUpperCase());
+  }
+  function clearCurrencySearch() {
+    setCurrencySearchInput("");
+    setCurrencyFilter("");
   }
 
   function startEdit(row) {
     setEditingId(row.id);
-    setEdit({
+    setField({
       type: row.type,
       currency_code: row.currency_code,
       foreign_amount: String(row.foreign_amount ?? ""),
@@ -105,13 +96,7 @@ export default function TransactionsPage() {
 
   function cancelEdit() {
     setEditingId(null);
-    setEdit({
-      type: "SELL",
-      currency_code: "USD",
-      foreign_amount: "",
-      rate: "",
-      customer_name: "",
-    });
+    resetEdit();
   }
 
   async function saveEdit(id) {
@@ -136,7 +121,7 @@ export default function TransactionsPage() {
       });
 
       cancelEdit();
-      await load();
+      await refresh();
     } catch (e) {
       alert(e?.response?.data?.error || e.message);
     }
@@ -148,7 +133,7 @@ export default function TransactionsPage() {
 
     try {
       await axios.delete(`/api/transactions/${id}`);
-      await load();
+      await refresh();
     } catch (e) {
       alert(e?.response?.data?.error || e.message);
     }
@@ -170,12 +155,12 @@ export default function TransactionsPage() {
     if (!cur) return;
 
     const newRate = edit.type === "BUY" ? cur.buy_rate : cur.sell_rate;
-    setEdit((p) => ({ ...p, rate: String(newRate) }));
+    setField("rate", String(newRate));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [edit.currency_code, edit.type, editingId, currencies]);
 
   useEffect(() => {
-    load();
+    refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [date]);
 
@@ -262,8 +247,39 @@ export default function TransactionsPage() {
               />
             </label>
 
+            <label className="tx-date">
+              <span>Currency Search</span>
+              <input
+                className="tx-input"
+                type="text"
+                placeholder="e.g. USD"
+                value={currencySearchInput}
+                onChange={(e) => setCurrencySearchInput(e.target.value.toUpperCase())}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") applyCurrencySearch();
+                }}
+              />
+            </label>
             <button
-              onClick={load}
+                onClick={applyCurrencySearch}
+                className="tx-btn tx-btn--primary"
+                type="button"
+                disabled={loading}
+            >
+                Search
+            </button>
+
+            <button
+                onClick={clearCurrencySearch}
+                className="tx-btn tx-btn--ghost"
+                type="button"
+                disabled={loading}
+            >
+                Clear
+            </button>
+
+            <button
+              onClick={refresh}
               className="tx-btn tx-btn--ghost"
               type="button"
               disabled={loading}
@@ -345,7 +361,13 @@ export default function TransactionsPage() {
             <div className="tx-table-title">
               {date ? new Date(date + "T00:00:00").toLocaleDateString("en-GB") : ""} {t("dailyLog")}
             </div>
-            <div className="tx-table-meta">{loading ? "Loading…" : `${rows.length} row(s)`}</div>
+            <div className="tx-table-meta">
+              {loading
+                ? "Loading…"
+                : currencyFilter
+                  ? `${rows.length} row(s) for ${currencyFilter}`
+                  : `${rows.length} row(s)`}
+            </div>
           </div>
         </div>
 
@@ -377,8 +399,14 @@ export default function TransactionsPage() {
                 <tr>
                   <td colSpan={10} className="tx-empty">
                     <div className="tx-empty__icon">🧾</div>
-                    <div className="tx-empty__title">No transactions for this date</div>
-                    <div className="tx-empty__sub">Try selecting another date or create a new transaction.</div>
+                    <div className="tx-empty__title">
+                      {currencyFilter ? `No ${currencyFilter} transactions for this date` : "No transactions for this date"}
+                    </div>
+                    <div className="tx-empty__sub">
+                      {currencyFilter
+                        ? "Try another currency code or clear the search."
+                        : "Try selecting another date or create a new transaction."}
+                    </div>
                   </td>
                 </tr>
               ) : (
@@ -397,7 +425,7 @@ export default function TransactionsPage() {
                           <select
                             className="tx-select"
                             value={edit.type}
-                            onChange={(e) => setEdit((p) => ({ ...p, type: e.target.value }))}
+                            onChange={(e) => setField("type", e.target.value)}
                           >
                             <option value="BUY">BUY</option>
                             <option value="SELL">SELL</option>
@@ -414,7 +442,7 @@ export default function TransactionsPage() {
                           <select
                             className="tx-select"
                             value={edit.currency_code}
-                            onChange={(e) => setEdit((p) => ({ ...p, currency_code: e.target.value }))}
+                            onChange={(e) => setField("currency_code", e.target.value)}
                           >
                             {currencies.map((c) => (
                               <option key={c.code} value={c.code}>
@@ -433,7 +461,7 @@ export default function TransactionsPage() {
                             className="tx-input tx-input--sm mono"
                             type="number"
                             value={edit.foreign_amount}
-                            onChange={(e) => setEdit((p) => ({ ...p, foreign_amount: e.target.value }))}
+                            onChange={(e) => setField("foreign_amount", e.target.value)}
                           />
                         ) : (
                           formatNumber(r.foreign_amount)
@@ -446,7 +474,7 @@ export default function TransactionsPage() {
                             className="tx-input tx-input--sm mono"
                             type="number"
                             value={edit.rate}
-                            onChange={(e) => setEdit((p) => ({ ...p, rate: e.target.value }))}
+                            onChange={(e) => setField("rate", e.target.value)}
                           />
                         ) : (
                           formatNumber(r.rate)
@@ -464,7 +492,7 @@ export default function TransactionsPage() {
                           <input
                             className="tx-input tx-input--sm"
                             value={edit.customer_name}
-                            onChange={(e) => setEdit((p) => ({ ...p, customer_name: e.target.value }))}
+                            onChange={(e) => setField("customer_name", e.target.value)}
                             placeholder="Customer name"
                           />
                         ) : (

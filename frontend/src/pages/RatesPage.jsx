@@ -1,53 +1,46 @@
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import useT from "../useT";
-
-function formatNumber(n) {
-  const num = Number(n);
-  if (!Number.isFinite(num)) return String(n ?? "");
-  return num.toLocaleString("en-US");
-}
+import {formatNumber} from "../utils/formatters";
+import { useApi } from "../hooks/useApi";
+import { useForm } from "../hooks/useForm";
 
 export default function RatesPage() {
   const {t,lang}=useT();
+  
+  // useApi for data fetching
+  const { data, loading, error, execute: refresh } = useApi(
+    () => axios.get("/api/currencies"),
+    { immediate: true }
+  );
+   
+  //local state for UI
   const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
   const [savingCode, setSavingCode] = useState("");
-  const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
+  const [actionError,setActionError]=useState("");
   const [deletingCode, setDeletingCode] = useState("");
 
   // New currency form
-  const [newCode, setNewCode] = useState("");
-  const [newName, setNewName] = useState("");
-  const [newBuy, setNewBuy] = useState("");
-  const [newSell, setNewSell] = useState("");
-
-  async function load() {
-    setError("");
-    setMsg("");
-    setLoading(true);
-    try {
-      const res = await axios.get("/api/currencies");
-      setRows(
-        (res.data || []).map((r) => ({
-          ...r,
-          _buy: String(r.buy_rate),
-          _sell: String(r.sell_rate),
-          _active: !!r.is_active,
-          _dirty: false,
-        }))
-      );
-    } catch (e) {
-      setError(e?.response?.data?.error || e.message);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const {values:newCurrency, setField, reset:resetNewCurrency }=useForm({
+    newCode:"",
+    newName:"",
+    newBuy:"",
+    newSell:""
+  })
 
   useEffect(() => {
-    load();
-  }, []);
+    if(!data) return;
+    setRows(
+      (data||[]).map((r)=>({
+        ...r,
+        _buy:String(r.buy_rate),
+        _sell:String(r.sell_rate),
+        _active:!!r.is_active,
+        _dirty:false
+      }))
+    )
+  }, [data]);
 
   function updateRow(code, patch) {
     setRows((prev) =>
@@ -56,15 +49,15 @@ export default function RatesPage() {
   }
 
   async function saveRow(code) {
-    setError("");
+    setActionError("");
     setMsg("");
     const row = rows.find((r) => r.code === code);
     if (!row) return;
 
     const buy = Number(row._buy);
     const sell = Number(row._sell);
-    if (!Number.isFinite(buy) || buy <= 0) return setError("Buy rate must be > 0");
-    if (!Number.isFinite(sell) || sell <= 0) return setError("Sell rate must be > 0");
+    if (!Number.isFinite(buy) || buy <= 0) return setActionError("Buy rate must be > 0");
+    if (!Number.isFinite(sell) || sell <= 0) return setActionError("Sell rate must be > 0");
 
     setSavingCode(code);
     try {
@@ -74,16 +67,16 @@ export default function RatesPage() {
         is_active: row._active,
       });
       setMsg(`Saved ${code}`);
-      await load();
+      await refresh();
     } catch (e) {
-      setError(e?.response?.data?.error || e.message);
+      setActionError(e?.response?.data?.error || e.message);
     } finally {
       setSavingCode("");
     }
   }
 
   async function deleteRow(code) {
-    setError("");
+    setActionError("");
     setMsg("");
 
     const ok = window.confirm(`Delete currency ${code}? This cannot be undone.`);
@@ -93,9 +86,9 @@ export default function RatesPage() {
     try {
       await axios.delete(`/api/admin/currencies/${code}`);
       setMsg(`Deleted ${code}`);
-      await load();
+      await refresh();
     } catch (e) {
-      setError(e?.response?.data?.error || e.message);
+      setActionError(e?.response?.data?.error || e.message);
     } finally {
       setDeletingCode("");
     }
@@ -103,18 +96,18 @@ export default function RatesPage() {
 
   async function createCurrency(e) {
     e.preventDefault();
-    setError("");
+    setActionError("");
     setMsg("");
 
-    const code = newCode.trim().toUpperCase();
-    const name = newName.trim();
-    const buy = Number(newBuy);
-    const sell = Number(newSell);
+    const code = newCurrency.newCode.trim().toUpperCase();
+    const name = newCurrency.newName.trim();
+    const buy = Number(newCurrency.newBuy);
+    const sell = Number(newCurrency.newSell);
 
-    if (!code) return setError("Currency code is required (e.g. USD)");
-    if (!name) return setError("Currency name is required");
-    if (!Number.isFinite(buy) || buy <= 0) return setError("Buy rate must be > 0");
-    if (!Number.isFinite(sell) || sell <= 0) return setError("Sell rate must be > 0");
+    if (!code) return setActionError("Currency code is required (e.g. USD)");
+    if (!name) return setActionError("Currency name is required");
+    if (!Number.isFinite(buy) || buy <= 0) return setActionError("Buy rate must be > 0");
+    if (!Number.isFinite(sell) || sell <= 0) return setActionError("Sell rate must be > 0");
 
     try {
       await axios.post("/api/admin/currencies", {
@@ -125,13 +118,10 @@ export default function RatesPage() {
         is_active: true,
       });
       setMsg(`Created ${code}`);
-      setNewCode("");
-      setNewName("");
-      setNewBuy("");
-      setNewSell("");
-      await load();
+      resetNewCurrency();
+      await refresh();
     } catch (e2) {
-      setError(e2?.response?.data?.error || e2.message);
+      setActionError(e2?.response?.data?.error || e2.message);
     }
   }
 
@@ -171,7 +161,7 @@ export default function RatesPage() {
             </div>
           </div>
 
-          <button onClick={load} className="tx-btn tx-btn--ghost" type="button" title="Refresh">
+          <button onClick={refresh} className="tx-btn tx-btn--ghost" type="button" title="Refresh">
             Refresh
           </button>
         </div>
@@ -180,8 +170,15 @@ export default function RatesPage() {
       {/* Alerts */}
       {error ? (
         <div className="tx-alert tx-alert--danger">
-          <div className="tx-alert__title">Action failed</div>
+          <div className="tx-alert__title">Couldn’t load rates</div>
           <div className="tx-alert__body">{error}</div>
+        </div>
+      ) : null}
+
+      {actionError ? (
+        <div className="tx-alert tx-alert--danger">
+          <div className="tx-alert__title">Action failed</div>
+          <div className="tx-alert__body">{actionError}</div>
         </div>
       ) : null}
 
@@ -205,8 +202,8 @@ export default function RatesPage() {
             <span>Code</span>
             <input
               className="tx-input"
-              value={newCode}
-              onChange={(e) => setNewCode(e.target.value)}
+              value={newCurrency.newCode}
+              onChange={(e) => setField("newCode",e.target.value)}
               placeholder="USD"
               maxLength={10}
             />
@@ -216,8 +213,8 @@ export default function RatesPage() {
             <span>Name</span>
             <input
               className="tx-input"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
+              value={newCurrency.newName}
+              onChange={(e) => setField("newName", e.target.value)}
               placeholder="US Dollar"
             />
           </label>
@@ -226,8 +223,8 @@ export default function RatesPage() {
             <span>Buy rate</span>
             <input
               className="tx-input mono"
-              value={newBuy}
-              onChange={(e) => setNewBuy(e.target.value)}
+              value={newCurrency.newBuy}
+              onChange={(e) => setField("newBuy", e.target.value)}
               placeholder="3300"
               inputMode="decimal"
             />
@@ -237,8 +234,8 @@ export default function RatesPage() {
             <span>Sell rate</span>
             <input
               className="tx-input mono"
-              value={newSell}
-              onChange={(e) => setNewSell(e.target.value)}
+              value={newCurrency.newSell}
+              onChange={(e) => setField("newSell", e.target.value)}
               placeholder="3350"
               inputMode="decimal"
             />

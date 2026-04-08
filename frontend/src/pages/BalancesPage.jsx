@@ -1,37 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import useT from "../useT";
-
-function todayISO() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function formatNumber(n) {
-  const num = Number(n);
-  if (!Number.isFinite(num)) return String(n ?? "-");
-  return num.toLocaleString("en-US");
-}
+import { todayISO,formatNumber } from "../utils/formatters";
+import { useApi } from "../hooks/useApi";
+import { useForm } from "../hooks/useForm";
 
 export default function BalancesPage() {
   const { t, lang } = useT();
   const [date, setDate] = useState(todayISO());
   const [me, setMe] = useState(null);
 
-  const [data, setData] = useState(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  // useApi for data fetching - refetches when date changes
+  const { data, loading, error: apiError, execute: refresh } = useApi(
+    () => axios.get(`/api/balances?date=${encodeURIComponent(date)}`),
+    { immediate: true, deps: [date] }
+  );
 
-  // CASH inputs
-  const [openingInput, setOpeningInput] = useState("");
-  const [closingInput, setClosingInput] = useState("");
-
-  // MOBILE inputs
-  const [openingMobileInput, setOpeningMobileInput] = useState("");
-  const [closingMobileInput, setClosingMobileInput] = useState("");
+  // useForm for MMK inputs
+  const { values: mmkInputs, setField, setFields } = useForm({
+    openingInput: "",
+    closingInput: "",
+    openingMobileInput: "",
+    closingMobileInput: ""
+  });
 
   // Active currencies
   const [currencies, setCurrencies] = useState([]);
@@ -45,6 +36,8 @@ export default function BalancesPage() {
   const [cashOpenMsg, setCashOpenMsg] = useState(""); // under cash opening card
   const [cashCloseMsg, setCashCloseMsg] = useState(""); // under cash closing card
   const [fxMsgByCur, setFxMsgByCur] = useState({}); // under each FX card {USD:"...", ...}
+
+  const [error, setError] = useState("");
 
   function clearMsgs() {
     setCashOpenMsg("");
@@ -85,41 +78,27 @@ export default function BalancesPage() {
     return Number.isFinite(n) ? n : NaN;
   }
 
-  async function load() {
-    setError("");
-    setFxError("");
-    setLoading(true);
-    clearMsgs();
+  // Update mmkInputs when data loads
+  useEffect(() => {
+    if (!data) return;
+    setFields({
+      openingInput: data.openingBalanceMMK ?? "",
+      closingInput: data.closingBalanceMMK ?? "",
+      openingMobileInput: data.openingMobileMMK ?? "",
+      closingMobileInput: data.closingMobileMMK ?? "",
+    });
 
-    try {
-      const res = await axios.get(`/api/balances?date=${encodeURIComponent(date)}`);
-      setData(res.data);
-
-      // prefill CASH inputs
-      setOpeningInput(res.data.openingBalanceMMK ?? "");
-      setClosingInput(res.data.closingBalanceMMK ?? "");
-
-      // prefill MOBILE inputs
-      setOpeningMobileInput(res.data.openingMobileMMK ?? "");
-      setClosingMobileInput(res.data.closingMobileMMK ?? "");
-
-      // prefill FX inputs from API rows
-      const list = res.data?.fxBalances ?? [];
-      const openMap = {};
-      const closeMap = {};
-      for (const fx of list) {
-        openMap[fx.currency] = fx.openingAmount ?? "";
-        closeMap[fx.currency] = fx.closingAmount ?? "";
-      }
-      setFxOpeningInputs(openMap);
-      setFxClosingInputs(closeMap);
-    } catch (e) {
-      setError(e?.response?.data?.error || e.message);
-      setData(null);
-    } finally {
-      setLoading(false);
+    // prefill FX inputs from API rows
+    const list = data?.fxBalances ?? [];
+    const openMap = {};
+    const closeMap = {};
+    for (const fx of list) {
+      openMap[fx.currency] = fx.openingAmount ?? "";
+      closeMap[fx.currency] = fx.closingAmount ?? "";
     }
-  }
+    setFxOpeningInputs(openMap);
+    setFxClosingInputs(closeMap);
+  }, [data]);
 
   // auth/me
   useEffect(() => {
@@ -136,11 +115,6 @@ export default function BalancesPage() {
       })
       .catch(() => setCurrencies([]));
   }, []);
-
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [date]);
 
   const isAdmin = me?.role === "admin";
 
@@ -175,12 +149,12 @@ export default function BalancesPage() {
     setFxError("");
     setCashCloseMsg(""); // only show under correct card
 
-    const openingCash = Number(openingInput);
+    const openingCash = Number(mmkInputs.openingInput);
     if (!Number.isFinite(openingCash) || openingCash < 0) {
       return setError("Opening CASH must be a number >= 0");
     }
 
-    const openingMobile = parseOptionalNumber(openingMobileInput);
+    const openingMobile = parseOptionalNumber(mmkInputs.openingMobileInput);
     if (Number.isNaN(openingMobile) || (openingMobile !== null && openingMobile < 0)) {
       return setError("Opening MOBILE must be a number >= 0 (or leave blank)");
     }
@@ -191,7 +165,7 @@ export default function BalancesPage() {
         openingBalanceMMK: openingCash,
         openingMobileMMK: openingMobile, // null ok
       });
-      await load();
+      await refresh();
       flashCashOpenMsg("✅ Opening saved");
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
@@ -207,7 +181,7 @@ export default function BalancesPage() {
     if (data.openingBalanceMMK == null) return setError("Set opening CASH first.");
 
     // ✅ If blank => use suggested closing
-    const closingCashParsed = parseOptionalNumber(closingInput);
+    const closingCashParsed = parseOptionalNumber(mmkInputs.closingInput);
     const suggestedCash = data?.suggestedClosingMMK ?? null;
     const closingCash =
       closingCashParsed === null ? (suggestedCash == null ? NaN : Number(suggestedCash)) : closingCashParsed;
@@ -221,7 +195,7 @@ export default function BalancesPage() {
     }
 
     // ✅ Mobile: blank => suggested mobile (if exists), otherwise null
-    const closingMobileParsed = parseOptionalNumber(closingMobileInput);
+    const closingMobileParsed = parseOptionalNumber(mmkInputs.closingMobileInput);
     const suggestedMobile = data?.suggestedClosingMobileMMK ?? null;
     const closingMobile =
       closingMobileParsed === null
@@ -240,7 +214,7 @@ export default function BalancesPage() {
         closingBalanceMMK: closingCash,
         closingMobileMMK: closingMobile, // null ok
       });
-      await load();
+      await refresh();
       flashCashCloseMsg("✅ Day closed (closing saved)");
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
@@ -252,7 +226,7 @@ export default function BalancesPage() {
     setFxError("");
     try {
       await axios.post("/api/balances/reopen", { date });
-      await load();
+      await refresh();
       flashCashCloseMsg("✅ Day re-opened");
     } catch (e) {
       setError(e?.response?.data?.error || e.message);
@@ -273,7 +247,7 @@ export default function BalancesPage() {
 
     try {
       await axios.post("/api/balances/open-fx", { date, currency, openingAmount: amount });
-      await load();
+      await refresh();
       flashFxMsg(currency, "✅ Opening saved");
     } catch (e) {
       setFxError(e?.response?.data?.error || e.message);
@@ -301,7 +275,7 @@ export default function BalancesPage() {
 
     try {
       await axios.post("/api/balances/close-fx", { date, currency, closingAmount: amount });
-      await load();
+      await refresh();
       flashFxMsg(currency, "✅ Closing saved");
     } catch (e) {
       setFxError(e?.response?.data?.error || e.message);
@@ -319,7 +293,8 @@ export default function BalancesPage() {
 
     const foreignIn = existing?.foreignIn ?? 0;
     const foreignOut = existing?.foreignOut ?? 0;
-    const netForeign = existing?.netForeign ?? Number((foreignIn - foreignOut).toFixed(2));
+    const buyMMK=existing?.buyMMK ?? 0;
+    const sellMMK=existing?.sellMMK ?? 0;
 
     const suggestedClosingAmount = existing?.suggestedClosingAmount ?? null;
 
@@ -330,7 +305,8 @@ export default function BalancesPage() {
       closingAmount,
       foreignIn,
       foreignOut,
-      netForeign,
+      buyMMK,
+      sellMMK,
       suggestedClosingAmount,
     };
   });
@@ -350,7 +326,7 @@ export default function BalancesPage() {
             <input className="tx-input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
           </label>
 
-          <button onClick={load} className="tx-btn tx-btn--ghost" type="button" disabled={loading} title="Refresh">
+          <button onClick={refresh} className="tx-btn tx-btn--ghost" type="button" disabled={loading} title="Refresh">
             {loading ? "Refreshing…" : "Refresh"}
           </button>
 
@@ -469,7 +445,7 @@ export default function BalancesPage() {
                         <div className="bal-fx-code">
                           {fx.currency} <span className="bal-fx-name">— {fx.name}</span>
                         </div>
-                        <div className="bal-fx-meta">Net = In (BUY) - Out (SELL)</div>
+                        <div className="bal-fx-meta">Daily buy/sell totals for this currency.</div>
                       </div>
                     </div>
 
@@ -545,10 +521,14 @@ export default function BalancesPage() {
                       <div className="bal-stat">
                         <span>Out (SELL)</span>
                         <b className="mono">{formatNumber(fx.foreignOut)}</b>
+                      </div>                 
+                        <div className="bal-stat">
+                        <span>BUY MMK</span>
+                        <b className="mono bal-neg">{formatNumber(fx.buyMMK)}</b>
                       </div>
                       <div className="bal-stat">
-                        <span>Net</span>
-                        <b className="mono">{formatNumber(fx.netForeign)}</b>
+                        <span>SELL MMK</span>
+                        <b className="mono bal-pos">{formatNumber(fx.sellMMK)}</b>
                       </div>
                     </div>
                   </div>
@@ -577,25 +557,25 @@ export default function BalancesPage() {
                 {/* OPENING */}
                 <div className="bal-admin-block">
                   <label className="bal-field">
-                    <span>{lang === "mm" ? "ယနေ့အတွက် အဖွင့်ငွေ" : "Set opening CASH (MMK)"}</span>
+                    <span>{lang === "mm" ? "ယနေ့အတွက် အဖွင့်ငွေ" : "Set opening CASH (MMK)"}</span>
                     <input
                       className="tx-input mono"
                       type="number"
-                      value={openingInput}
-                      onChange={(e) => setOpeningInput(e.target.value)}
+                      value={mmkInputs.openingInput}
+                      onChange={(e) => setField("openingInput", e.target.value)}
                       placeholder="e.g. 12000000"
                       disabled={!!data.isClosed}
                     />
                   </label>
 
                   <label className="bal-field">
-                    <span>{lang === "mm" ? "Mobile banking အတွက်အဖွင့်ငွေ" : "Set opening mobile (MMK)"}</span>
+                    <span>{lang === "mm" ? "Mobile banking အတွက်အဖွင့်ငွေ" : "Set opening mobile (MMK)"}</span>
                     <input
                       className="tx-input mono"
                       type="number"
-                      value={openingMobileInput}
-                      onChange={(e) => setOpeningMobileInput(e.target.value)}
-                      placeholder={lang === "mm" ? "Blank ထားလို့ရပါတယ် mobile banking အတွက် မထည့်ဖြစ်ဘူးဆိုရင်" : "Leave blank if not tracking"}
+                      value={mmkInputs.openingMobileInput}
+                      onChange={(e) => setField("openingMobileInput", e.target.value)}
+                      placeholder={lang === "mm" ? "Blank ထားလို့ရပါတယ် mobile banking အတွက် မထည့်ဖြစ်ဘူးဆိုရင်" : "Leave blank if not tracking"}
                       disabled={!!data.isClosed}
                     />
                   </label>
@@ -619,8 +599,8 @@ export default function BalancesPage() {
                     <input
                       className="tx-input mono"
                       type="number"
-                      value={closingInput}
-                      onChange={(e) => setClosingInput(e.target.value)}
+                      value={mmkInputs.closingInput}
+                      onChange={(e) => setField("closingInput", e.target.value)}
                       placeholder={
                         data?.suggestedClosingMMK == null
                           ? "e.g. 13000000"
@@ -635,8 +615,8 @@ export default function BalancesPage() {
                     <input
                       className="tx-input mono"
                       type="number"
-                      value={closingMobileInput}
-                      onChange={(e) => setClosingMobileInput(e.target.value)}
+                      value={mmkInputs.closingMobileInput}
+                      onChange={(e) => setField("closingMobileInput", e.target.value)}
                       placeholder={
                         data?.suggestedClosingMobileMMK == null
                           ? (lang === "mm" ? "Blank ထားလို့ရပါတယ် mobile banking အတွက် မထည့်ဖြစ်ဘူးဆိုရင်" : "Leave blank if not tracking")

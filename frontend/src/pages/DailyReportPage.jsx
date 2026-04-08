@@ -2,20 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import { useSearchParams } from "react-router-dom";
 import useT from "../useT";
-
-function todayISO() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function formatNumber(n) {
-  const num = Number(n);
-  if (!Number.isFinite(num)) return String(n ?? "-");
-  return num.toLocaleString("en-US");
-}
+import { todayISO, formatNumber } from "../utils/formatters";
+import { useApi } from "../hooks/useApi";
 
 function PaymentCell({ cash, mobile }) {
   const c = Number(cash ?? 0);
@@ -49,40 +37,25 @@ export default function DailyReportPage() {
   const {t}=useT();
   const [params] = useSearchParams();
   const [date, setDate] = useState(params.get("date") || todayISO());
-  const [bal, setBal] = useState(null);
-  const [rows, setRows] = useState([]);
-  const [me, setMe] = useState(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
   const autoPrint = params.get("print") === "1";
 
-  async function load() {
-    setError("");
-    setLoading(true);
-    try {
-      const [meRes, balRes, txRes] = await Promise.all([
-        axios.get("/api/auth/me"),
-        axios.get(`/api/balances?date=${encodeURIComponent(date)}`),
-        axios.get(`/api/transactions?date=${encodeURIComponent(date)}`),
-      ]);
+  // useApi for data fetching - refetches when date changes
+  const { data: apiData, loading, error, execute: refresh } = useApi(
+    () => Promise.all([
+      axios.get("/api/auth/me"),
+      axios.get(`/api/balances?date=${encodeURIComponent(date)}`),
+      axios.get(`/api/transactions?date=${encodeURIComponent(date)}`),
+    ]).then(([meRes, balRes, txRes]) => ({
+      me: meRes.data,
+      bal: balRes.data,
+      rows: Array.isArray(txRes.data) ? txRes.data : [],
+    })),
+    { immediate: true, deps: [date] }
+  );
 
-      setMe(meRes.data);
-      setBal(balRes.data);
-      setRows(Array.isArray(txRes.data) ? txRes.data : []);
-    } catch (e) {
-      setError(e?.response?.data?.error || e.message);
-      setBal(null);
-      setRows([]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [date]);
+  const me = apiData?.me || null;
+  const bal = apiData?.bal || null;
+  const rows = apiData?.rows || [];
 
   // Auto print when loaded
   useEffect(() => {
@@ -150,7 +123,7 @@ export default function DailyReportPage() {
           </label>
 
           <button
-            onClick={load}
+            onClick={refresh}
             className="tx-btn tx-btn--ghost"
             type="button"
             disabled={loading}

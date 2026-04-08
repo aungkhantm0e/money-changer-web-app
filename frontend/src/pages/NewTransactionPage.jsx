@@ -1,50 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import useT from "../useT";
+import { localISODate, toLocalDateTimeWithOffset, nowLocalWithOffset } from "../utils/formatters";
+import { useForm } from "../hooks/useForm";
 
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-
-// YYYY-MM-DD in device LOCAL timezone (no UTC shift)
-function localISODate(d = new Date()) {
-  const yyyy = d.getFullYear();
-  const mm = pad2(d.getMonth() + 1);
-  const dd = pad2(d.getDate());
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-// "YYYY-MM-DDTHH:mm" -> "YYYY-MM-DDTHH:mm:00+11:00" (device timezone offset)
-function toLocalDateTimeWithOffset(dtLocalValue) {
-  const base = dtLocalValue.length === 16 ? `${dtLocalValue}:00` : dtLocalValue;
-
-  const offMin = -new Date().getTimezoneOffset(); // e.g. +660 for +11:00
-  const sign = offMin >= 0 ? "+" : "-";
-  const abs = Math.abs(offMin);
-  const hh = pad2(Math.floor(abs / 60));
-  const mm = pad2(abs % 60);
-
-  return `${base}${sign}${hh}:${mm}`;
-}
-
-// Local "now" with timezone offset: "YYYY-MM-DDTHH:mm:ss+11:00"
-function nowLocalWithOffset() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const MM = pad2(d.getMonth() + 1);
-  const dd = pad2(d.getDate());
-  const hh = pad2(d.getHours());
-  const mm = pad2(d.getMinutes());
-  const ss = pad2(d.getSeconds());
-
-  const offMin = -d.getTimezoneOffset();
-  const sign = offMin >= 0 ? "+" : "-";
-  const abs = Math.abs(offMin);
-  const oh = pad2(Math.floor(abs / 60));
-  const om = pad2(abs % 60);
-
-  return `${yyyy}-${MM}-${dd}T${hh}:${mm}:${ss}${sign}${oh}:${om}`;
-}
 
 export default function NewTransactionPage() {
   const { t, lang } = useT();
@@ -74,10 +33,12 @@ export default function NewTransactionPage() {
   const [savedAtISO, setSavedAtISO] = useState(null); // store the exact sent datetime string (local+offset)
 
   // tender controls
-  const [tenderMode, setTenderMode] = useState("CASH"); // CASH | MOBILE | SPLIT
-  const [cashMMK, setCashMMK] = useState(""); // used in SPLIT, optional in others
-  const [mobileProvider, setMobileProvider] = useState(""); // optional
-  const [mobileRef, setMobileRef] = useState(""); // optional
+  const {values:tender, setField}=useForm({
+    tenderMode:"CASH",
+    cashMMK:"",
+    mobileProvider:"",
+    mobileRef:""
+  });
 
   // Initial: set default bizDate to local today and check if closed
 
@@ -142,7 +103,7 @@ export default function NewTransactionPage() {
       : Number(selectedCurrency.sell_rate);
   }, [selectedCurrency, type]);
 
- 
+  
 
   const mmkAmount = useMemo(() => {
     const fa = Number(foreignAmount);
@@ -152,24 +113,24 @@ export default function NewTransactionPage() {
 
   // derived split amounts
   const cashSplit = useMemo(() => {
-    if (tenderMode !== "SPLIT") return 0;
-    const v = Number(cashMMK);
+    if (tender.tenderMode !== "SPLIT") return 0;
+    const v = Number(tender.cashMMK);
     if (!Number.isFinite(v) || v < 0) return 0;
     return v;
-  }, [tenderMode, cashMMK]);
+  }, [tender.tenderMode, tender.cashMMK]);
 
   const mobileSplit = useMemo(() => {
-    if (tenderMode !== "SPLIT") return 0;
+    if (tender.tenderMode !== "SPLIT") return 0;
     const m = Number((mmkAmount - cashSplit).toFixed(2));
     return m > 0 ? m : 0;
-  }, [tenderMode, mmkAmount, cashSplit]);
+  }, [tender.tenderMode, mmkAmount, cashSplit]);
 
   // ✅ NEW: does this transaction use mobile tender?
   const usesMobileTender = useMemo(() => {
-    if (tenderMode === "MOBILE") return true;
-    if (tenderMode === "SPLIT") return mobileSplit > 0;
+    if (tender.tenderMode === "MOBILE") return true;
+    if (tender.tenderMode === "SPLIT") return mobileSplit > 0;
     return false;
-  }, [tenderMode, mobileSplit]);
+  }, [tender.tenderMode, mobileSplit]);
 
   function validate() {
     const fa = Number(foreignAmount);
@@ -177,8 +138,8 @@ export default function NewTransactionPage() {
     if (!Number.isFinite(fa) || fa <= 0) return "Foreign amount must be more than 0.";
     if (!rate || rate <= 0) return "Rate is invalid.";
 
-    if (tenderMode === "SPLIT") {
-      const c = Number(cashMMK);
+    if (tender.tenderMode === "SPLIT") {
+      const c = Number(tender.cashMMK);
       if (!Number.isFinite(c) || c < 0) return "Cash MMK must be a number >= 0.";
       if (c > mmkAmount) return "Cash MMK cannot be more than total MMK.";
       if (mobileSplit <= 0) return "Split requires some Mobile amount (total must be covered).";
@@ -190,17 +151,17 @@ export default function NewTransactionPage() {
   function buildPaymentsPayload() {
     if (mmkAmount <= 0) return [];
 
-    if (tenderMode === "CASH") {
+    if (tender.tenderMode === "CASH") {
       return [{ method: "CASH_MMK", amountMMK: mmkAmount }];
     }
 
-    if (tenderMode === "MOBILE") {
+    if (tender.tenderMode === "MOBILE") {
       return [
         {
           method: "MOBILE_BANKING",
           amountMMK: mmkAmount,
-          provider: mobileProvider || null,
-          referenceNo: mobileRef || null,
+          provider: tender.mobileProvider || null,
+          referenceNo: tender.mobileRef || null,
         },
       ];
     }
@@ -212,8 +173,8 @@ export default function NewTransactionPage() {
       rows.push({
         method: "MOBILE_BANKING",
         amountMMK: mobileSplit,
-        provider: mobileProvider || null,
-        referenceNo: mobileRef || null,
+        provider: tender.mobileProvider || null,
+        referenceNo: tender.mobileRef || null,
       });
 
     return rows;
@@ -302,20 +263,20 @@ export default function NewTransactionPage() {
   }
 
   function paymentSummaryText() {
-    if (tenderMode === "CASH") return `Payment: CASH MMK ${money(mmkAmount)}`;
-    if (tenderMode === "MOBILE") {
+    if (tender.tenderMode === "CASH") return `Payment: CASH MMK ${money(mmkAmount)}`;
+    if (tender.tenderMode === "MOBILE") {
       const bits = [];
       bits.push(`Payment: MOBILE MMK ${money(mmkAmount)}`);
-      if (mobileProvider) bits.push(`Provider: ${mobileProvider}`);
-      if (mobileRef) bits.push(`Ref: ${mobileRef}`);
+      if (tender.mobileProvider) bits.push(`Provider: ${tender.mobileProvider}`);
+      if (tender.mobileRef) bits.push(`Ref: ${tender.mobileRef}`);
       return bits.join("\n");
     }
     const bits = [];
     bits.push("Payment: SPLIT");
     bits.push(`Cash  : MMK ${money(cashSplit)}`);
     bits.push(`Mobile: MMK ${money(mobileSplit)}`);
-    if (mobileProvider) bits.push(`Provider: ${mobileProvider}`);
-    if (mobileRef) bits.push(`Ref: ${mobileRef}`);
+    if (tender.mobileProvider) bits.push(`Provider: ${tender.mobileProvider}`);
+    if (tender.mobileRef) bits.push(`Ref: ${tender.mobileRef}`);
     return bits.join("\n");
   }
 
@@ -632,39 +593,39 @@ Thank you
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
                 <button
                   type="button"
-                  className={"tx-btn " + (tenderMode === "CASH" ? "tx-btn--primary" : "tx-btn--ghost")}
-                  onClick={() => setTenderMode("CASH")}
+                  className={"tx-btn " + (tender.tenderMode === "CASH" ? "tx-btn--primary" : "tx-btn--ghost")}
+                  onClick={() => setField("tenderMode","CASH")}
                 >
                   {lang === "mm" ? "ပိုက်ဆံ" : "Cash"}
                 </button>
 
                 <button
                   type="button"
-                  className={"tx-btn " + (tenderMode === "MOBILE" ? "tx-btn--primary" : "tx-btn--ghost")}
-                  onClick={() => setTenderMode("MOBILE")}
+                  className={"tx-btn " + (tender.tenderMode === "MOBILE" ? "tx-btn--primary" : "tx-btn--ghost")}
+                  onClick={() => setField("tenderMode","MOBILE")}
                 >
                   Mobile Banking
                 </button>
 
                 <button
                   type="button"
-                  className={"tx-btn " + (tenderMode === "SPLIT" ? "tx-btn--primary" : "tx-btn--ghost")}
-                  onClick={() => setTenderMode("SPLIT")}
+                  className={"tx-btn " + (tender.tenderMode === "SPLIT" ? "tx-btn--primary" : "tx-btn--ghost")}
+                  onClick={() => setField("tenderMode","SPLIT")}
                 >
                   {lang === "mm" ? "တစ်၀က်ဆီပေးမည်" : "Split"}
                 </button>
               </div>
             </label>
 
-            {tenderMode === "SPLIT" ? (
+            {tender.tenderMode === "SPLIT" ? (
               <label className="nt-field">
                 <span>{lang === "mm" ? "တစ်၀က်ဆီပေးမည်( ပိုက်ဆံ + mobile banking )" : "Cash MMK (split)"}</span>
                 <input
                   className="tx-input mono"
                   type="number"
                   inputMode="decimal"
-                  value={cashMMK}
-                  onChange={(e) => setCashMMK(e.target.value)}
+                  value={tender.cashMMK}
+                  onChange={(e) => setField("cashMMK",e.target.value)}
                   placeholder="e.g. 100000"
                 />
                 <div className="nt-help">
@@ -676,20 +637,20 @@ Thank you
               </label>
             ) : null}
 
-            {tenderMode !== "CASH" ? (
-              <label className={"nt-field " + (tenderMode === "SPLIT" ? "" : "nt-span-2")}>
+            {tender.tenderMode !== "CASH" ? (
+              <label className={"nt-field " + (tender.tenderMode === "SPLIT" ? "" : "nt-span-2")}>
                 <span>{lang === "mm" ? "ဘဏ်နာမည်ရေးရန်" : "Mobile provider & reference (optional)"}</span>
                 <div style={{ display: "grid", gap: 8, marginTop: 6 }}>
                   <input
                     className="tx-input"
-                    value={mobileProvider}
-                    onChange={(e) => setMobileProvider(e.target.value)}
+                    value={tender.mobileProvider}
+                    onChange={(e) => setField("mobileProvider",e.target.value)}
                     placeholder="Provider (e.g. KBZPay, WavePay)"
                   />
                   <input
                     className="tx-input mono"
-                    value={mobileRef}
-                    onChange={(e) => setMobileRef(e.target.value)}
+                    value={tender.mobileRef}
+                    onChange={(e) => setField("mobileRef",e.target.value)}
                     placeholder="Reference No (optional)"
                   />
                 </div>
@@ -704,11 +665,11 @@ Thank you
               </div>
 
               <div className="mc-card" style={{ padding: 12, marginTop: 6 }}>
-                {tenderMode === "CASH" ? (
+                {tender.tenderMode === "CASH" ? (
                   <div className="mono">
                     {lang === "mm" ? "မြန်မာငွေ ပမာဏ " : "CASH_MMK "}: {money(mmkAmount)}
                   </div>
-                ) : tenderMode === "MOBILE" ? (
+                ) : tender.tenderMode === "MOBILE" ? (
                   <div className="mono">MOBILE_BANKING: {money(mmkAmount)}</div>
                 ) : (
                   <>

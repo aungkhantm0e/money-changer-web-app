@@ -4,16 +4,12 @@
 // ✅ Hover shows the nearest month ONLY when inside the chart
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { formatNumber } from "../utils/formatters";
 import axios from "axios";
+import { useApi } from "../hooks/useApi";
 
 function currentYear() {
   return new Date().getFullYear();
-}
-
-function formatNumber(n) {
-  const num = Number(n);
-  if (!Number.isFinite(num)) return String(n ?? "—");
-  return num.toLocaleString("en-US");
 }
 
 function clamp(n, a, b) {
@@ -22,31 +18,18 @@ function clamp(n, a, b) {
 
 export default function ReportsPage() {
   const [year, setYear] = useState(currentYear());
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+
+  // useApi for data fetching - refetches when year changes
+  const { data: apiData, loading, error, execute: refresh } = useApi(
+    () => axios.get(`/api/reports/monthly?year=${encodeURIComponent(year)}`)
+      .then(res => res.data),
+    { immediate: true, deps: [year] }
+  );
+
+  const rows = apiData || [];
 
   const [hoverIdx, setHoverIdx] = useState(null);
   const svgRef = useRef(null);
-
-  async function load(y = year) {
-    setError("");
-    setLoading(true);
-    try {
-      const res = await axios.get(`/api/reports/monthly?year=${encodeURIComponent(y)}`);
-      setRows(Array.isArray(res.data) ? res.data : []);
-    } catch (e) {
-      setError(e?.response?.data?.error || e.message);
-      setRows([]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load(year);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [year]);
 
   // Normalize to 12 months
   const chartData = useMemo(() => {
@@ -211,7 +194,7 @@ export default function ReportsPage() {
           <button
             className="tx-btn tx-btn--ghost"
             type="button"
-            onClick={() => load(year)}
+            onClick={() => refresh(year)}
             disabled={loading}
           >
             {loading ? "Loading…" : "Refresh"}

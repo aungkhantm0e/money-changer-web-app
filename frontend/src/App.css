@@ -628,7 +628,11 @@ body {
   text-align: right;
 }
 
-.tx-table-wrap{ overflow-x: auto; }
+.tx-table-wrap{
+   overflow-x: auto; 
+   overflow-y: auto;
+   max-height: 65vh;
+}
 
 .tx-table{
   width: 100%;
@@ -643,9 +647,12 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   border-bottom: 1px solid var(--border);
-  background: rgba(248,250,252,0.7);
+  background: rgba(248,250,252,0.95);
   white-space: nowrap;
   text-align: center;
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 .tx-table tbody td{
@@ -1760,7 +1767,7 @@ body {
 .bal-fx-stats {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 12px;
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--border);

@@ -1047,7 +1047,8 @@ app.get("/api/reports/yearly", requireAuth, async (req, res) => {
 // List transactions (optionally by date: YYYY-MM-DD)
 app.get("/api/transactions", requireAuth, async (req, res) => {
   try {
-    const { date } = req.query;
+    const { date, currency } = req.query;
+    const currencyCode=currency? String(currency).trim().toUpperCase() : "";
 
     const baseQuery = `
       SELECT
@@ -1070,26 +1071,31 @@ app.get("/api/transactions", requireAuth, async (req, res) => {
         ON tp.transaction_id = t.id
     `;
 
-    if (!date) {
-      const result = await pool.query(
-        `
-        ${baseQuery}
-        GROUP BY t.id
-        ORDER BY t.date_time DESC
-        LIMIT 100
-        `
-      );
-      return res.json(result.rows);
+    const conditions=[];
+    const params=[];
+
+    if (date) {
+      params.push(date);
+      conditions.push(`t.business_date = $${params.length}::date`);
     }
+    if (currencyCode) {
+      params.push(currencyCode);
+      conditions.push(`t.currency_code = $${params.length}`);
+    }  
+
+    const whereClauses=conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const limitClause=date ? "" : "LIMIT 100";
+   
 
     const result = await pool.query(
       `
       ${baseQuery}
-      WHERE t.business_date = $1::date
+      ${whereClauses}
       GROUP BY t.id
       ORDER BY t.date_time DESC
+      ${limitClause}
       `,
-      [date]
+      params
     );
 
     res.json(result.rows);
@@ -1465,9 +1471,12 @@ app.get("/api/balances", async (req, res) => {
       SELECT
         currency_code,
         COALESCE(SUM(CASE WHEN type='BUY'  THEN foreign_amount ELSE 0 END), 0) AS foreign_in,
-        COALESCE(SUM(CASE WHEN type='SELL' THEN foreign_amount ELSE 0 END), 0) AS foreign_out
+        COALESCE(SUM(CASE WHEN type='SELL' THEN foreign_amount ELSE 0 END), 0) AS foreign_out,
+        COALESCE(SUM(CASE WHEN type='BUY' THEN mmk_amount ELSE 0 END), 0) AS buy_mmk,
+        COALESCE(SUM(CASE WHEN type='SELL' THEN mmk_amount ELSE 0 END), 0) AS sell_mmk
       FROM transactions
       WHERE business_date = $1::date
+        AND currency_code IS NOT NULL
       GROUP BY currency_code
       ORDER BY currency_code
       `,
@@ -1500,32 +1509,51 @@ app.get("/api/balances", async (req, res) => {
       const cur = r.currency_code;
       const foreignIn = Number(r.foreign_in);
       const foreignOut = Number(r.foreign_out);
+      const buyMMK = Number(r.buy_mmk);
+      const sellMMK = Number(r.sell_mmk);
       const netForeign = Number((foreignIn - foreignOut).toFixed(2));
-      fxTotalsByCur[cur] = { foreignIn, foreignOut, netForeign };
+      fxTotalsByCur[cur] = { foreignIn, foreignOut, buyMMK, sellMMK, netForeign };
     }
 
-    fxBalances = fxBalances.map((fx) => {
-      const t = fxTotalsByCur[fx.currency] || { foreignIn: 0, foreignOut: 0, netForeign: 0 };
+    const allCurrencies=new Set([
+      ...fxBalances.map((fx)=>fx.currency),
+      ...Object.keys(fxTotalsByCur),
+    ]);
 
-      const suggestedClosingAmount =
-        fx.openingAmount === null || fx.openingAmount === undefined
-          ? null
-          : Number((Number(fx.openingAmount) + t.netForeign).toFixed(2));
-
-      const diffAmount =
-        fx.closingAmount === null || fx.closingAmount === undefined || suggestedClosingAmount === null
-          ? null
-          : Number((Number(fx.closingAmount) - suggestedClosingAmount).toFixed(2));
-
-      return {
-        ...fx,
-        foreignIn: t.foreignIn,
-        foreignOut: t.foreignOut,
-        netForeign: t.netForeign,
-        suggestedClosingAmount,
-        diffAmount,
-      };
-    });
+   fxBalances = Array.from(allCurrencies)
+      .sort()
+      .map((currency) => {
+        const fx = fxBalances.find((x) => x.currency === currency) || {
+          currency,
+          openingAmount: null,
+          closingAmount: null,
+        };
+        const t = fxTotalsByCur[currency] || {
+          foreignIn: 0,
+          foreignOut: 0,
+          buyMMK: 0,
+          sellMMK: 0,
+          netForeign: 0,
+        };
+        const suggestedClosingAmount =
+          fx.openingAmount === null || fx.openingAmount === undefined
+            ? null
+            : Number((Number(fx.openingAmount) + t.netForeign).toFixed(2));
+        const diffAmount =
+          fx.closingAmount === null || fx.closingAmount === undefined || suggestedClosingAmount === null
+            ? null
+            : Number((Number(fx.closingAmount) - suggestedClosingAmount).toFixed(2));
+        return {
+          ...fx,
+          foreignIn: t.foreignIn,
+          foreignOut: t.foreignOut,
+          buyMMK: t.buyMMK,
+          sellMMK: t.sellMMK,
+          netForeign: t.netForeign,
+          suggestedClosingAmount,
+          diffAmount,
+        };
+      });
 
     res.json({
       date,
